@@ -1,0 +1,10 @@
+NextbotCreator uses open-source Rust crates listed in Cargo.lock. Their license metadata and source links are available through crates.io.
+
+Portable distributions include FFmpeg 8.1.2 Essentials Build by Gyan Doshi. That Windows build is licensed under GPLv3 and its corresponding FFmpeg source is available at:
+https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+
+The distribution also includes the FFmpeg build's license as tools/ffmpeg-license.txt.
+
+Binary build and checksum:
+https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip
+https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip.sha256

@@ -1,0 +1,7 @@
+/target/
+/dist/
+/vendor/tools/cache/
+/.scratch-*/
+/settings.json
+/projects/
+
