@@ -939,7 +939,9 @@ mod tests {
         let mut project = Project::new("Example", root);
         project.nextbots[0].admin_only = true;
         let shared = render_shared(&project, &project.nextbots[0], &SoundNames::default());
-        assert!(shared.starts_with("-- This nextbot was created by NextbotCreator 0.1.0"));
+        assert!(shared.starts_with(&format!(
+            "-- This nextbot was created by NextbotCreator {APP_VERSION}"
+        )));
         assert!(shared.contains("AdminOnly = true"));
         assert!(shared.contains("ENT.Base = \"drgbase_nextbot_sprite\""));
         assert!(shared.contains("DrGBase.AddNextbot(ENT)"));
@@ -992,7 +994,9 @@ mod tests {
         for file in ["shared.lua", "init.lua", "cl_init.lua"] {
             let path = root.join("lua/entities/npc_my_nextbot").join(file);
             let lua = fs::read_to_string(path).unwrap();
-            assert!(lua.starts_with("-- This nextbot was created by NextbotCreator 0.1.0"));
+            assert!(lua.starts_with(&format!(
+                "-- This nextbot was created by NextbotCreator {APP_VERSION}"
+            )));
         }
         let server = fs::read_to_string(root.join("lua/entities/npc_my_nextbot/init.lua")).unwrap();
         assert!(server.contains("function ENT:OnSpawn()"));

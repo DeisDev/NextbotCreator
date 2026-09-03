@@ -4,7 +4,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$version = '0.1.0'
+$manifest = Join-Path $workspace 'Cargo.toml'
+$version = ((cargo metadata --manifest-path $manifest --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object { $_.name -eq 'nextbot-creator' } | Select-Object -First 1).version
+if (-not $version) { throw 'Could not read the package version from Cargo.toml' }
 $distRoot = Join-Path $workspace 'dist'
 $bundle = Join-Path $distRoot "NextbotCreator-$version-windows-x64"
 $cache = Join-Path $workspace 'vendor\tools\cache'

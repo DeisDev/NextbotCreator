@@ -159,6 +159,20 @@ impl CreatorApp {
         }
     }
 
+    fn launch_gmod(&mut self) {
+        let Some(gmod_root) = self.settings.garrys_mod_root.clone() else {
+            self.set_error("Choose or detect a Garry's Mod folder first.");
+            return;
+        };
+        match integration::launch_garrys_mod(&gmod_root) {
+            Ok(executable) => self.set_status(format!(
+                "Launched Garry's Mod from {}",
+                executable.display()
+            )),
+            Err(error) => self.set_error(error),
+        }
+    }
+
     fn create_project(&mut self) {
         match persistence::create_project(
             &self.settings.projects_root,
@@ -284,6 +298,19 @@ impl CreatorApp {
                     if ui.button("Home").clicked() {
                         self.project = None;
                         self.preview = None;
+                    }
+                    let launch = ui
+                        .add_enabled(
+                            self.settings.garrys_mod_root.is_some(),
+                            egui::Button::new("Launch GMod"),
+                        )
+                        .on_hover_text(if self.settings.garrys_mod_root.is_some() {
+                            "Start Garry's Mod from the configured installation"
+                        } else {
+                            "Choose or detect a Garry's Mod installation first"
+                        });
+                    if launch.clicked() {
+                        self.launch_gmod();
                     }
                     if self.project.is_some() {
                         if ui.button("Save").clicked() {

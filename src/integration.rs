@@ -17,12 +17,19 @@ pub enum IntegrationError {
     JunctionCommand(std::io::Error),
     #[error("Windows could not create the junction: {0}")]
     JunctionFailed(String),
+    #[error("Garry's Mod executable was not found at {0}")]
+    GmodExecutableMissing(PathBuf),
+    #[error("failed to launch Garry's Mod from {path}: {source}")]
+    LaunchFailed {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("junctions are only supported on Windows")]
+    #[error("this Garry's Mod integration is only supported on Windows")]
     UnsupportedPlatform,
 }
 
@@ -95,6 +102,45 @@ pub fn detect_garrys_mod() -> Vec<PathBuf> {
     results.sort();
     results.dedup();
     results
+}
+
+pub fn gmod_executable(gmod_root: &Path) -> Result<PathBuf, IntegrationError> {
+    let root = normalize_gmod_root(gmod_root)
+        .ok_or_else(|| IntegrationError::InvalidGmodRoot(gmod_root.to_path_buf()))?;
+    let install_root = root
+        .parent()
+        .ok_or_else(|| IntegrationError::InvalidGmodRoot(gmod_root.to_path_buf()))?;
+    let executable = install_root.join("gmod.exe");
+    if executable.is_file() {
+        Ok(executable)
+    } else {
+        Err(IntegrationError::GmodExecutableMissing(executable))
+    }
+}
+
+pub fn launch_garrys_mod(gmod_root: &Path) -> Result<PathBuf, IntegrationError> {
+    let executable = gmod_executable(gmod_root)?;
+
+    #[cfg(windows)]
+    {
+        let working_directory = executable
+            .parent()
+            .ok_or_else(|| IntegrationError::InvalidGmodRoot(gmod_root.to_path_buf()))?;
+        Command::new(&executable)
+            .current_dir(working_directory)
+            .spawn()
+            .map_err(|source| IntegrationError::LaunchFailed {
+                path: executable.clone(),
+                source,
+            })?;
+        Ok(executable)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = executable;
+        Err(IntegrationError::UnsupportedPlatform)
+    }
 }
 
 pub fn parse_steam_library_paths(text: &str) -> Vec<PathBuf> {
@@ -213,6 +259,26 @@ mod tests {
                 PathBuf::from(r"D:\Games\Steam"),
             ]
         );
+    }
+
+    #[test]
+    fn resolves_gmod_executable_from_the_content_root() {
+        let root = std::env::temp_dir().join(format!(
+            "nextbot_creator_launch_test_{}",
+            std::process::id()
+        ));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        let install_root = root.join("GarrysMod");
+        let content_root = install_root.join("garrysmod");
+        fs::create_dir_all(content_root.join("addons")).unwrap();
+        fs::write(install_root.join("gmod.exe"), b"test").unwrap();
+        assert_eq!(
+            gmod_executable(&content_root).unwrap(),
+            install_root.join("gmod.exe")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
