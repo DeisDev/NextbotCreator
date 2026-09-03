@@ -89,6 +89,272 @@ impl Nextbot {
     pub fn property_mut(&mut self, name: &str) -> Option<&mut PropertyValue> {
         self.properties.get_mut(name)
     }
+
+    pub fn apply_behavior_preset(&mut self, preset: BehaviorPreset) {
+        let profile = preset.profile();
+        self.set_choice_property("BehaviourType", "AI_BEHAV_BASE");
+        self.set_choice_property("DefaultRelationship", profile.relationship);
+        self.set_bool_property("Omniscient", profile.omniscient);
+        self.set_bool_property("Frightening", profile.frightening);
+        self.set_number_property("SpotDuration", profile.spot_duration);
+        self.set_number_property("RangeAttackRange", 0.0);
+        self.set_number_property("MeleeAttackRange", profile.melee_range);
+        self.set_number_property("ReachEnemyRange", profile.reach_range);
+        self.set_number_property("AvoidEnemyRange", 0.0);
+        self.set_number_property("AvoidAfraidOfRange", profile.avoid_afraid_range);
+        self.set_number_property("WatchAfraidOfRange", profile.watch_afraid_range);
+        self.set_number_property("SightFOV", profile.sight_fov);
+        self.set_number_property("SightRange", profile.sight_range);
+        self.set_number_property("HearingCoefficient", profile.hearing);
+        self.set_integer_property("SpawnHealth", profile.health);
+        self.set_number_property("HealthRegen", profile.health_regen);
+        self.set_number_property("MinPhysDamage", profile.minimum_environment_damage);
+        self.set_number_property("MinFallDamage", profile.minimum_environment_damage);
+        self.set_number_property("Acceleration", profile.acceleration);
+        self.set_number_property("Deceleration", profile.acceleration);
+        self.set_number_property("JumpHeight", profile.jump_height);
+        self.set_number_property("StepHeight", profile.step_height);
+        self.set_number_property("MaxYawRate", profile.yaw_rate);
+        self.set_number_property("DeathDropHeight", profile.death_drop_height);
+        self.set_number_property("WalkSpeed", profile.walk_speed);
+        self.set_number_property("RunSpeed", profile.run_speed);
+        for name in [
+            "ClimbLedges",
+            "ClimbProps",
+            "ClimbLadders",
+            "ClimbLaddersUp",
+            "ClimbLaddersDown",
+        ] {
+            self.set_bool_property(name, profile.climbs);
+        }
+        self.set_number_property("ClimbSpeed", profile.climb_speed);
+        if profile.climbs {
+            self.set_choice_property("ClimbLedgesMaxHeight", "math.huge");
+            self.set_choice_property("ClimbLaddersUpMaxHeight", "math.huge");
+            self.set_choice_property("ClimbLaddersDownMaxHeight", "math.huge");
+            self.set_number_property("ClimbLedgesMinHeight", 0.0);
+            self.set_number_property("ClimbLaddersUpMinHeight", 0.0);
+            self.set_number_property("ClimbLaddersDownMinHeight", 0.0);
+        }
+
+        self.combat.melee_enabled = profile.melee_enabled;
+        self.combat.melee_damage_min = profile.melee_damage;
+        self.combat.melee_damage_max = profile.melee_damage;
+        self.combat.melee_delay = profile.melee_delay;
+        self.combat.ranged_enabled = false;
+        self.hooks.patrol_when_idle = profile.patrol;
+        self.hooks.spot_damage_attacker = profile.spot_damage_attacker;
+    }
+
+    fn set_bool_property(&mut self, name: &str, value: bool) {
+        if let Some(PropertyValue::Bool(current)) = self.properties.get_mut(name) {
+            *current = value;
+        }
+    }
+
+    fn set_number_property(&mut self, name: &str, value: f64) {
+        if let Some(PropertyValue::Number(current)) = self.properties.get_mut(name) {
+            *current = value;
+        }
+    }
+
+    fn set_integer_property(&mut self, name: &str, value: i64) {
+        if let Some(PropertyValue::Integer(current)) = self.properties.get_mut(name) {
+            *current = value;
+        }
+    }
+
+    fn set_choice_property(&mut self, name: &str, value: &str) {
+        if let Some(PropertyValue::Choice(current)) = self.properties.get_mut(name) {
+            *current = value.to_owned();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BehaviorPreset {
+    Friendly,
+    Aggressive,
+    Hostile,
+    Chase,
+}
+
+impl BehaviorPreset {
+    pub const ALL: [Self; 4] = [Self::Friendly, Self::Aggressive, Self::Hostile, Self::Chase];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Friendly => "Friendly",
+            Self::Aggressive => "Aggressive",
+            Self::Hostile => "Hostile",
+            Self::Chase => "Chase",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Friendly => "Allied and non-combatant.",
+            Self::Aggressive => "Neutral until provoked, then fights back.",
+            Self::Hostile => "Attacks enemies on sight with balanced movement and damage.",
+            Self::Chase => "Omniscient, relentless, highly durable, fast, and kills in one hit.",
+        }
+    }
+
+    fn profile(self) -> BehaviorProfile {
+        match self {
+            Self::Friendly => BehaviorProfile {
+                relationship: "D_LI",
+                omniscient: false,
+                frightening: false,
+                spot_duration: 30.0,
+                melee_range: 0.0,
+                reach_range: 50.0,
+                avoid_afraid_range: 500.0,
+                watch_afraid_range: 750.0,
+                sight_fov: 150.0,
+                sight_range: 15_000.0,
+                hearing: 1.0,
+                health: 100,
+                health_regen: 0.0,
+                minimum_environment_damage: 10.0,
+                acceleration: 1_000.0,
+                jump_height: 50.0,
+                step_height: 20.0,
+                yaw_rate: 250.0,
+                death_drop_height: 200.0,
+                walk_speed: 100.0,
+                run_speed: 200.0,
+                climbs: false,
+                climb_speed: 60.0,
+                melee_enabled: false,
+                melee_damage: 0.0,
+                melee_delay: 0.3,
+                patrol: true,
+                spot_damage_attacker: false,
+            },
+            Self::Aggressive => BehaviorProfile {
+                relationship: "D_NU",
+                omniscient: false,
+                frightening: false,
+                spot_duration: 45.0,
+                melee_range: 60.0,
+                reach_range: 50.0,
+                avoid_afraid_range: 500.0,
+                watch_afraid_range: 750.0,
+                sight_fov: 180.0,
+                sight_range: 15_000.0,
+                hearing: 1.0,
+                health: 100,
+                health_regen: 0.0,
+                minimum_environment_damage: 10.0,
+                acceleration: 1_200.0,
+                jump_height: 60.0,
+                step_height: 20.0,
+                yaw_rate: 300.0,
+                death_drop_height: 200.0,
+                walk_speed: 110.0,
+                run_speed: 240.0,
+                climbs: false,
+                climb_speed: 60.0,
+                melee_enabled: true,
+                melee_damage: 15.0,
+                melee_delay: 0.3,
+                patrol: true,
+                spot_damage_attacker: true,
+            },
+            Self::Hostile => BehaviorProfile {
+                relationship: "D_HT",
+                omniscient: false,
+                frightening: true,
+                spot_duration: 60.0,
+                melee_range: 65.0,
+                reach_range: 55.0,
+                avoid_afraid_range: 500.0,
+                watch_afraid_range: 750.0,
+                sight_fov: 180.0,
+                sight_range: 20_000.0,
+                hearing: 1.25,
+                health: 150,
+                health_regen: 0.0,
+                minimum_environment_damage: 10.0,
+                acceleration: 1_500.0,
+                jump_height: 75.0,
+                step_height: 24.0,
+                yaw_rate: 360.0,
+                death_drop_height: 200.0,
+                walk_speed: 120.0,
+                run_speed: 275.0,
+                climbs: false,
+                climb_speed: 75.0,
+                melee_enabled: true,
+                melee_damage: 25.0,
+                melee_delay: 0.25,
+                patrol: true,
+                spot_damage_attacker: true,
+            },
+            Self::Chase => BehaviorProfile {
+                relationship: "D_HT",
+                omniscient: true,
+                frightening: true,
+                spot_duration: 3_600.0,
+                melee_range: 100.0,
+                reach_range: 90.0,
+                avoid_afraid_range: 0.0,
+                watch_afraid_range: 0.0,
+                sight_fov: 360.0,
+                sight_range: 1_000_000.0,
+                hearing: 10.0,
+                health: 100_000,
+                health_regen: 100.0,
+                minimum_environment_damage: 1_000_000.0,
+                acceleration: 3_000.0,
+                jump_height: 300.0,
+                step_height: 35.0,
+                yaw_rate: 720.0,
+                death_drop_height: 1_000_000.0,
+                walk_speed: 200.0,
+                run_speed: 360.0,
+                climbs: true,
+                climb_speed: 300.0,
+                melee_enabled: true,
+                melee_damage: 1_000_000.0,
+                melee_delay: 0.05,
+                patrol: false,
+                spot_damage_attacker: true,
+            },
+        }
+    }
+}
+
+struct BehaviorProfile {
+    relationship: &'static str,
+    omniscient: bool,
+    frightening: bool,
+    spot_duration: f64,
+    melee_range: f64,
+    reach_range: f64,
+    avoid_afraid_range: f64,
+    watch_afraid_range: f64,
+    sight_fov: f64,
+    sight_range: f64,
+    hearing: f64,
+    health: i64,
+    health_regen: f64,
+    minimum_environment_damage: f64,
+    acceleration: f64,
+    jump_height: f64,
+    step_height: f64,
+    yaw_rate: f64,
+    death_drop_height: f64,
+    walk_speed: f64,
+    run_speed: f64,
+    climbs: bool,
+    climb_speed: f64,
+    melee_enabled: bool,
+    melee_damage: f32,
+    melee_delay: f32,
+    patrol: bool,
+    spot_damage_attacker: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +410,8 @@ impl SpawnTab {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VisualSettings {
     pub source: Option<PathBuf>,
+    #[serde(default)]
+    pub killfeed_icon: KillfeedIconSettings,
     pub material_name: String,
     pub texture_size: u32,
     pub frames_per_second: f32,
@@ -158,6 +426,7 @@ impl Default for VisualSettings {
     fn default() -> Self {
         Self {
             source: None,
+            killfeed_icon: KillfeedIconSettings::default(),
             material_name: "nextbot".into(),
             texture_size: 512,
             frames_per_second: 10.0,
@@ -170,13 +439,39 @@ impl Default for VisualSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KillfeedIconSettings {
+    pub mode: KillfeedIconMode,
+    pub source: Option<PathBuf>,
+}
+
+impl Default for KillfeedIconSettings {
+    fn default() -> Self {
+        Self {
+            mode: KillfeedIconMode::NextbotSprite,
+            source: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KillfeedIconMode {
+    NextbotSprite,
+    CustomImage,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioSettings {
     pub spawn: Vec<PathBuf>,
     pub idle: Vec<PathBuf>,
+    #[serde(default)]
+    pub idle_loop: bool,
     pub damage: Vec<PathBuf>,
     pub death: Vec<PathBuf>,
     pub downed: Vec<PathBuf>,
+    #[serde(default)]
+    pub jump: Vec<PathBuf>,
     pub footsteps: Vec<PathBuf>,
     pub volume: f32,
     pub pitch: u16,
@@ -188,9 +483,11 @@ impl Default for AudioSettings {
         Self {
             spawn: Vec::new(),
             idle: Vec::new(),
+            idle_loop: false,
             damage: Vec::new(),
             death: Vec::new(),
             downed: Vec::new(),
+            jump: Vec::new(),
             footsteps: Vec::new(),
             volume: 1.0,
             pitch: 100,
@@ -690,5 +987,58 @@ mod tests {
     #[test]
     fn lua_strings_escape_code_delimiters() {
         assert_eq!(lua_string("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
+    }
+
+    #[test]
+    fn chase_preset_is_relentless_and_friendly_resets_it() {
+        let mut bot = Nextbot::new("Preset Test", "npc_preset_test");
+        bot.apply_behavior_preset(BehaviorPreset::Chase);
+        assert_eq!(
+            bot.properties.get("DefaultRelationship"),
+            Some(&PropertyValue::Choice("D_HT".into()))
+        );
+        assert_eq!(
+            bot.properties.get("Omniscient"),
+            Some(&PropertyValue::Bool(true))
+        );
+        assert_eq!(bot.combat.melee_damage_min, 1_000_000.0);
+        assert_eq!(
+            bot.properties.get("RunSpeed"),
+            Some(&PropertyValue::Number(360.0))
+        );
+        assert!(!bot.hooks.patrol_when_idle);
+
+        bot.apply_behavior_preset(BehaviorPreset::Friendly);
+        assert_eq!(
+            bot.properties.get("DefaultRelationship"),
+            Some(&PropertyValue::Choice("D_LI".into()))
+        );
+        assert_eq!(
+            bot.properties.get("SpawnHealth"),
+            Some(&PropertyValue::Integer(100))
+        );
+        assert!(!bot.combat.melee_enabled);
+        assert!(bot.hooks.patrol_when_idle);
+    }
+
+    #[test]
+    fn projects_without_new_media_fields_still_deserialize() {
+        let project = Project::new("Legacy", PathBuf::from("legacy"));
+        let mut value = serde_json::to_value(project).unwrap();
+        let bot = value["nextbots"][0].as_object_mut().unwrap();
+        bot["visual"]
+            .as_object_mut()
+            .unwrap()
+            .remove("killfeed_icon");
+        bot["audio"].as_object_mut().unwrap().remove("jump");
+        bot["audio"].as_object_mut().unwrap().remove("idle_loop");
+
+        let loaded: Project = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            loaded.nextbots[0].visual.killfeed_icon,
+            KillfeedIconSettings::default()
+        );
+        assert!(loaded.nextbots[0].audio.jump.is_empty());
+        assert!(!loaded.nextbots[0].audio.idle_loop);
     }
 }

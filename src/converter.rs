@@ -38,6 +38,18 @@ pub struct VisualArtifact {
     pub aspect_ratio: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct KillfeedIconArtifact {
+    pub vtf_path: PathBuf,
+    pub vmt_path: PathBuf,
+}
+
+struct DecodedVisual {
+    frames: Vec<DynamicImage>,
+    aspect_ratio: f32,
+    original_vtf: Option<Vec<u8>>,
+}
+
 pub fn convert_visual(
     source: &Path,
     materials_root: &Path,
@@ -46,11 +58,6 @@ pub fn convert_visual(
     class_name: &str,
     settings: &VisualSettings,
 ) -> Result<VisualArtifact, ConversionError> {
-    let extension = source
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
     let output_stem = materials_root.join(material_relative.replace('/', "\\"));
     if let Some(parent) = output_stem.parent() {
         fs::create_dir_all(parent).map_err(|source| ConversionError::Io {
@@ -66,79 +73,25 @@ pub fn convert_visual(
     let vmt_path = output_stem.with_extension("vmt");
     let icon_path = entity_icon_root.join(format!("{class_name}.png"));
 
-    let (frames, aspect_ratio) = match extension.as_str() {
-        "vtf" => {
-            let bytes = fs::read(source).map_err(|source_error| ConversionError::Io {
-                path: source.to_path_buf(),
-                source: source_error,
-            })?;
-            let parsed = vtf::from_bytes(&bytes)?;
-            let frames = decode_vtf_frames(&parsed)?;
-            let ratio = frames[0].width() as f32 / frames[0].height().max(1) as f32;
-            fs::write(&vtf_path, bytes).map_err(|source| ConversionError::Io {
-                path: vtf_path.clone(),
-                source,
-            })?;
-            (frames, ratio)
-        }
-        "vmt" => {
-            let sibling_vtf = source.with_extension("vtf");
-            if !sibling_vtf.is_file() {
-                return Err(ConversionError::Unsupported(
-                    "a selected VMT must have a same-named VTF beside it".into(),
-                ));
-            }
-            let bytes = fs::read(&sibling_vtf).map_err(|source| ConversionError::Io {
-                path: sibling_vtf.clone(),
-                source,
-            })?;
-            let parsed = vtf::from_bytes(&bytes)?;
-            let frames = decode_vtf_frames(&parsed)?;
-            let ratio = frames[0].width() as f32 / frames[0].height().max(1) as f32;
-            fs::write(&vtf_path, bytes).map_err(|source| ConversionError::Io {
-                path: vtf_path.clone(),
-                source,
-            })?;
-            (frames, ratio)
-        }
-        "gif" => {
-            let file = fs::File::open(source).map_err(|source_error| ConversionError::Io {
-                path: source.to_path_buf(),
-                source: source_error,
-            })?;
-            let decoder = image::codecs::gif::GifDecoder::new(BufReader::new(file))?;
-            let decoded = decoder.into_frames().collect_frames()?;
-            let ratio = decoded
-                .first()
-                .map(|frame| frame.buffer().width() as f32 / frame.buffer().height().max(1) as f32)
-                .unwrap_or(1.0);
-            (
-                decoded
-                    .into_iter()
-                    .map(|frame| DynamicImage::ImageRgba8(frame.into_buffer()))
-                    .collect(),
-                ratio,
-            )
-        }
-        "png" | "jpg" | "jpeg" | "bmp" | "tga" | "webp" => {
-            let image = image::open(source)?;
-            let ratio = image.width() as f32 / image.height().max(1) as f32;
-            (vec![image], ratio)
-        }
-        other => return Err(ConversionError::Unsupported(other.to_owned())),
-    };
-    if frames.is_empty() {
+    let decoded = decode_visual(source)?;
+    if decoded.frames.is_empty() {
         return Err(ConversionError::Unsupported(
             "image contains no frames".into(),
         ));
     }
 
     let size = settings.texture_size.clamp(64, 4096).next_power_of_two();
-    let processed = frames
+    let processed = decoded
+        .frames
         .into_iter()
         .map(|frame| contain_square(frame, size))
         .collect::<Vec<_>>();
-    if extension != "vtf" && extension != "vmt" {
+    if let Some(bytes) = decoded.original_vtf {
+        fs::write(&vtf_path, bytes).map_err(|source| ConversionError::Io {
+            path: vtf_path.clone(),
+            source,
+        })?;
+    } else {
         let bytes = if processed.len() == 1 {
             vtf::create(processed[0].clone(), vtf::ImageFormat::Dxt5)?
         } else {
@@ -161,7 +114,112 @@ pub fn convert_visual(
         vmt_path,
         icon_path,
         frame_count: processed.len(),
+        aspect_ratio: decoded.aspect_ratio,
+    })
+}
+
+pub fn convert_killfeed_icon(
+    source: &Path,
+    materials_root: &Path,
+    material_relative: &str,
+) -> Result<KillfeedIconArtifact, ConversionError> {
+    let output_stem = materials_root.join(material_relative.replace('/', "\\"));
+    if let Some(parent) = output_stem.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConversionError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let decoded = decode_visual(source)?;
+    let frame = decoded
+        .frames
+        .into_iter()
+        .next()
+        .ok_or_else(|| ConversionError::Unsupported("image contains no frames".into()))?;
+    let processed = contain_square(frame, 128);
+    let vtf_path = output_stem.with_extension("vtf");
+    let vmt_path = output_stem.with_extension("vmt");
+    let bytes = vtf::create(processed, vtf::ImageFormat::Dxt5)?;
+    fs::write(&vtf_path, bytes).map_err(|source| ConversionError::Io {
+        path: vtf_path.clone(),
+        source,
+    })?;
+    write_vmt(
+        &vmt_path,
+        material_relative,
+        false,
+        &VisualSettings::default(),
+    )?;
+    Ok(KillfeedIconArtifact { vtf_path, vmt_path })
+}
+
+fn decode_visual(source: &Path) -> Result<DecodedVisual, ConversionError> {
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let (frames, aspect_ratio, original_vtf) = match extension.as_str() {
+        "vtf" => {
+            let bytes = fs::read(source).map_err(|source_error| ConversionError::Io {
+                path: source.to_path_buf(),
+                source: source_error,
+            })?;
+            let parsed = vtf::from_bytes(&bytes)?;
+            let frames = decode_vtf_frames(&parsed)?;
+            let ratio = frames[0].width() as f32 / frames[0].height().max(1) as f32;
+            (frames, ratio, Some(bytes))
+        }
+        "vmt" => {
+            let sibling_vtf = source.with_extension("vtf");
+            if !sibling_vtf.is_file() {
+                return Err(ConversionError::Unsupported(
+                    "a selected VMT must have a same-named VTF beside it".into(),
+                ));
+            }
+            let bytes = fs::read(&sibling_vtf).map_err(|source| ConversionError::Io {
+                path: sibling_vtf.clone(),
+                source,
+            })?;
+            let parsed = vtf::from_bytes(&bytes)?;
+            let frames = decode_vtf_frames(&parsed)?;
+            let ratio = frames[0].width() as f32 / frames[0].height().max(1) as f32;
+            (frames, ratio, Some(bytes))
+        }
+        "gif" => {
+            let file = fs::File::open(source).map_err(|source_error| ConversionError::Io {
+                path: source.to_path_buf(),
+                source: source_error,
+            })?;
+            let decoder = image::codecs::gif::GifDecoder::new(BufReader::new(file))?;
+            let decoded = decoder.into_frames().collect_frames()?;
+            let ratio = decoded
+                .first()
+                .map(|frame| frame.buffer().width() as f32 / frame.buffer().height().max(1) as f32)
+                .unwrap_or(1.0);
+            let frames = decoded
+                .into_iter()
+                .map(|frame| DynamicImage::ImageRgba8(frame.into_buffer()))
+                .collect();
+            (frames, ratio, None)
+        }
+        "png" | "jpg" | "jpeg" | "bmp" | "tga" | "webp" => {
+            let image = image::open(source)?;
+            let ratio = image.width() as f32 / image.height().max(1) as f32;
+            (vec![image], ratio, None)
+        }
+        other => return Err(ConversionError::Unsupported(other.to_owned())),
+    };
+    if frames.is_empty() {
+        return Err(ConversionError::Unsupported(
+            "image contains no frames".into(),
+        ));
+    }
+
+    Ok(DecodedVisual {
+        frames,
         aspect_ratio,
+        original_vtf,
     })
 }
 
@@ -353,6 +411,36 @@ mod tests {
         assert_eq!(copied.frame_count, 2);
         assert!(
             fs::read_to_string(copied.vmt_path)
+                .unwrap()
+                .contains("AnimatedTexture")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn killfeed_conversion_uses_a_static_128_pixel_valve_texture() {
+        let root = temp_folder("killfeed");
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("icon.png");
+        RgbaImage::from_pixel(20, 10, Rgba([255, 0, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let artifact = convert_killfeed_icon(
+            &source,
+            &root.join("materials"),
+            "nextbotcreator/test/npc_test_killfeed",
+        )
+        .unwrap();
+        let texture_bytes = fs::read(&artifact.vtf_path).unwrap();
+        let texture = vtf::from_bytes(&texture_bytes).unwrap();
+        let decoded = texture.highres_image.decode(0).unwrap();
+        assert_eq!(decoded.dimensions(), (128, 128));
+        assert_eq!(texture.header.frames, 1);
+        assert!(
+            !fs::read_to_string(artifact.vmt_path)
                 .unwrap()
                 .contains("AnimatedTexture")
         );

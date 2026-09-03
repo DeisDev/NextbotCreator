@@ -6,9 +6,10 @@ use eframe::egui::{self, Color32, RichText};
 use nextbot_creator::catalog::{PropertySection, PropertySpec, property_catalog};
 use nextbot_creator::converter;
 use nextbot_creator::domain::{
-    ATTACK_ACTIVITIES, BaseVariant, BindTrigger, DAMAGE_TYPES, HookAction, HookActionKind,
-    HookEvent, HookRecipe, Nextbot, POSSESSION_KEYS, PossessionAction, PossessionBind,
-    PossessionView, Project, PropertyValue, SpawnTab, sanitize_class_name, slugify,
+    ATTACK_ACTIVITIES, BaseVariant, BehaviorPreset, BindTrigger, DAMAGE_TYPES, HookAction,
+    HookActionKind, HookEvent, HookRecipe, KillfeedIconMode, Nextbot, POSSESSION_KEYS,
+    PossessionAction, PossessionBind, PossessionView, Project, PropertyValue, SpawnTab,
+    sanitize_class_name, slugify,
 };
 use nextbot_creator::generator;
 use nextbot_creator::integration::{self, LinkStatus};
@@ -66,6 +67,7 @@ pub struct CreatorApp {
     advanced_search: String,
     detected_gmod: Vec<PathBuf>,
     preview: Option<(PathBuf, egui::TextureHandle)>,
+    killfeed_preview: Option<(PathBuf, egui::TextureHandle)>,
 }
 
 impl CreatorApp {
@@ -82,7 +84,7 @@ impl CreatorApp {
         {
             settings.garrys_mod_root = detected_gmod.first().cloned();
         }
-        let recent_projects = persistence::discover_projects(&settings.projects_root);
+        let recent_projects = settings.available_projects();
         Self {
             portable_root,
             settings,
@@ -96,6 +98,7 @@ impl CreatorApp {
             advanced_search: String::new(),
             detected_gmod,
             preview: None,
+            killfeed_preview: None,
         }
     }
 
@@ -179,11 +182,19 @@ impl CreatorApp {
             self.new_project_name.trim(),
         ) {
             Ok(project) => {
+                let project_root = project.root.clone();
                 self.selected_bot = 0;
                 self.preview = None;
+                self.killfeed_preview = None;
                 self.project = Some(project);
+                self.settings.remember_project(&project_root);
                 self.refresh_recent();
-                self.set_status("Project created.");
+                match self.settings.save(&self.portable_root) {
+                    Ok(()) => self.set_status("Project created."),
+                    Err(error) => self.set_error(format!(
+                        "Project created, but its recent-project entry could not be saved: {error}"
+                    )),
+                }
             }
             Err(error) => self.set_error(error),
         }
@@ -192,17 +203,26 @@ impl CreatorApp {
     fn open_project(&mut self, path: &Path) {
         match persistence::load_project(path) {
             Ok(project) => {
+                let project_root = project.root.clone();
                 self.project = Some(project);
                 self.selected_bot = 0;
                 self.preview = None;
-                self.set_status("Project opened.");
+                self.killfeed_preview = None;
+                self.settings.remember_project(&project_root);
+                self.refresh_recent();
+                match self.settings.save(&self.portable_root) {
+                    Ok(()) => self.set_status("Project opened."),
+                    Err(error) => self.set_error(format!(
+                        "Project opened, but its recent-project entry could not be saved: {error}"
+                    )),
+                }
             }
             Err(error) => self.set_error(error),
         }
     }
 
     fn refresh_recent(&mut self) {
-        self.recent_projects = persistence::discover_projects(&self.settings.projects_root);
+        self.recent_projects = self.settings.available_projects();
     }
 
     fn import_visual(&mut self, context: &egui::Context) {
@@ -286,6 +306,44 @@ impl CreatorApp {
         );
     }
 
+    fn import_killfeed_icon(&mut self, context: &egui::Context) {
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        let Some(class_name) = project
+            .nextbots
+            .get(self.selected_bot)
+            .map(|bot| bot.class_name.clone())
+        else {
+            return;
+        };
+        let Some(source) = rfd::FileDialog::new()
+            .add_filter(
+                "Killfeed image",
+                &[
+                    "png", "jpg", "jpeg", "bmp", "tga", "webp", "gif", "vtf", "vmt",
+                ],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+        match persistence::import_source_asset(project, &class_name, &source) {
+            Ok(imported) => {
+                let Some(bot) = project.nextbots.get_mut(self.selected_bot) else {
+                    return;
+                };
+                bot.visual.killfeed_icon.mode = KillfeedIconMode::CustomImage;
+                bot.visual.killfeed_icon.source = Some(imported.clone());
+                self.killfeed_preview =
+                    load_preview_named(context, &imported, "killfeed_icon_preview")
+                        .map(|texture| (imported, texture));
+                self.set_status("Custom killfeed icon imported into the project.");
+            }
+            Err(error) => self.set_error(error),
+        }
+    }
+
     fn top_bar(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("top_bar")
             .frame(panel_frame())
@@ -298,6 +356,7 @@ impl CreatorApp {
                     if ui.button("Home").clicked() {
                         self.project = None;
                         self.preview = None;
+                        self.killfeed_preview = None;
                     }
                     let launch = ui
                         .add_enabled(
@@ -392,7 +451,7 @@ impl CreatorApp {
                 });
                 columns[1].group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.heading("Projects");
+                        ui.heading("Recent projects");
                         if ui.small_button("Refresh").clicked() {
                             self.refresh_recent();
                         }
@@ -411,7 +470,11 @@ impl CreatorApp {
                             .file_name()
                             .and_then(|name| name.to_str())
                             .unwrap_or("Project");
-                        if ui.selectable_label(false, name).clicked() {
+                        if ui
+                            .selectable_label(false, name)
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
                             self.open_project(&path);
                         }
                     }
@@ -546,6 +609,7 @@ impl CreatorApp {
                     {
                         self.selected_bot = index;
                         self.preview = None;
+                        self.killfeed_preview = None;
                     }
                 }
                 ui.add_space(8.0);
@@ -558,6 +622,8 @@ impl CreatorApp {
                         format!("npc_{}_{}", project.slug, index),
                     ));
                     self.selected_bot = project.nextbots.len() - 1;
+                    self.preview = None;
+                    self.killfeed_preview = None;
                 }
                 if ui.button("Duplicate").clicked()
                     && let Some(project) = self.project.as_mut()
@@ -567,6 +633,8 @@ impl CreatorApp {
                     duplicate.class_name = format!("{}_copy", duplicate.class_name);
                     project.nextbots.push(duplicate);
                     self.selected_bot = project.nextbots.len() - 1;
+                    self.preview = None;
+                    self.killfeed_preview = None;
                 }
                 let can_remove = self
                     .project
@@ -582,6 +650,7 @@ impl CreatorApp {
                         .selected_bot
                         .min(project.nextbots.len().saturating_sub(1));
                     self.preview = None;
+                    self.killfeed_preview = None;
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.label(RichText::new("DRGBase required in-game").small().weak());
@@ -671,6 +740,27 @@ impl CreatorApp {
         );
 
         ui.add_space(16.0);
+        ui.heading("Quick behavior presets");
+        ui.horizontal_wrapped(|ui| {
+            for preset in BehaviorPreset::ALL {
+                if ui
+                    .button(preset.label())
+                    .on_hover_text(preset.description())
+                    .clicked()
+                {
+                    bot.apply_behavior_preset(preset);
+                }
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Presets update related DRGBase, combat, movement, and event settings. Every value remains editable.",
+            )
+            .small()
+            .weak(),
+        );
+
+        ui.add_space(16.0);
         ui.heading("Common DRGBase settings");
         let specs = property_catalog()
             .into_iter()
@@ -685,9 +775,23 @@ impl CreatorApp {
             .as_ref()
             .and_then(|project| project.nextbots.get(self.selected_bot))
             .and_then(|bot| bot.visual.source.clone());
+        let killfeed_selected = self
+            .project
+            .as_ref()
+            .and_then(|project| project.nextbots.get(self.selected_bot))
+            .and_then(|bot| match bot.visual.killfeed_icon.mode {
+                KillfeedIconMode::NextbotSprite => bot.visual.source.clone(),
+                KillfeedIconMode::CustomImage => bot.visual.killfeed_icon.source.clone(),
+            });
         if self.preview.as_ref().map(|(path, _)| path) != selected.as_ref() {
             self.preview = selected.as_ref().and_then(|path| {
                 load_preview(context, path).map(|texture| (path.clone(), texture))
+            });
+        }
+        if self.killfeed_preview.as_ref().map(|(path, _)| path) != killfeed_selected.as_ref() {
+            self.killfeed_preview = killfeed_selected.as_ref().and_then(|path| {
+                load_preview_named(context, path, "killfeed_icon_preview")
+                    .map(|texture| (path.clone(), texture))
             });
         }
         ui.heading("Model & texture");
@@ -774,6 +878,56 @@ impl CreatorApp {
                 ui.checkbox(&mut bot.visual.translucent, "Transparency");
             },
         );
+
+        ui.add_space(16.0);
+        ui.heading("Killfeed icon");
+        ui.label(
+            "Generate a static 128 px Valve material from the first frame of the NextBot sprite, or choose a separate image.",
+        );
+        let previous_mode = bot.visual.killfeed_icon.mode;
+        field_row(
+            ui,
+            "Image source",
+            "The icon displayed when this NextBot gets a kill.",
+            |ui| {
+                ui.radio_value(
+                    &mut bot.visual.killfeed_icon.mode,
+                    KillfeedIconMode::NextbotSprite,
+                    "Use NextBot sprite",
+                );
+                ui.radio_value(
+                    &mut bot.visual.killfeed_icon.mode,
+                    KillfeedIconMode::CustomImage,
+                    "Use custom image",
+                );
+            },
+        );
+        let mode_changed = previous_mode != bot.visual.killfeed_icon.mode;
+        let custom_mode = matches!(bot.visual.killfeed_icon.mode, KillfeedIconMode::CustomImage);
+        let custom_source = bot.visual.killfeed_icon.source.clone();
+        let mut import_custom = false;
+        if custom_mode {
+            if ui.button("Import custom killfeed image...").clicked() {
+                import_custom = true;
+            }
+            if let Some(source) = &custom_source {
+                path_label(ui, source);
+            }
+        } else if selected.is_none() {
+            ui.colored_label(
+                Color32::YELLOW,
+                "Import a NextBot visual asset to generate its killfeed icon.",
+            );
+        }
+        if mode_changed {
+            self.killfeed_preview = None;
+        }
+        if import_custom {
+            self.import_killfeed_icon(context);
+        }
+        if let Some((_, texture)) = &self.killfeed_preview {
+            ui.add(egui::Image::new(texture).max_size(egui::vec2(128.0, 128.0)));
+        }
     }
 
     fn audio_editor(&mut self, ui: &mut egui::Ui) {
@@ -785,6 +939,7 @@ impl CreatorApp {
             AudioSlot::Damage,
             AudioSlot::Death,
             AudioSlot::Downed,
+            AudioSlot::Jump,
             AudioSlot::Footsteps,
         ];
         for slot in slots {
@@ -823,6 +978,23 @@ impl CreatorApp {
         ui.add_space(12.0);
         field_row(
             ui,
+            "Loop idle sounds",
+            "Replay the idle sound slot continuously without the normal delay between clips.",
+            |ui| {
+                ui.checkbox(&mut bot.audio.idle_loop, "Continuous idle audio");
+            },
+        );
+        if bot.audio.idle_loop {
+            ui.label(
+                RichText::new(
+                    "The advanced Idle sound delay value is preserved but ignored while looping is enabled.",
+                )
+                .small()
+                .weak(),
+            );
+        }
+        field_row(
+            ui,
             "Volume",
             "Sound-script volume from near-silent to full.",
             |ui| {
@@ -851,11 +1023,11 @@ impl CreatorApp {
         ui.add_enabled_ui(bot.combat.melee_enabled, |ui| {
             field_row(ui, "Damage", "Random inclusive damage range.", |ui| {
                 ui.add(
-                    egui::DragValue::new(&mut bot.combat.melee_damage_min).range(0.0..=100000.0),
+                    egui::DragValue::new(&mut bot.combat.melee_damage_min).range(0.0..=1_000_000.0),
                 );
                 ui.label("to");
                 ui.add(
-                    egui::DragValue::new(&mut bot.combat.melee_damage_max).range(0.0..=100000.0),
+                    egui::DragValue::new(&mut bot.combat.melee_damage_max).range(0.0..=1_000_000.0),
                 );
             });
             field_row(
@@ -1209,6 +1381,7 @@ enum AudioSlot {
     Damage,
     Death,
     Downed,
+    Jump,
     Footsteps,
 }
 
@@ -1220,6 +1393,7 @@ impl AudioSlot {
             Self::Damage => "Damage",
             Self::Death => "Death",
             Self::Downed => "Downed",
+            Self::Jump => "Jump",
             Self::Footsteps => "Footsteps",
         }
     }
@@ -1231,6 +1405,7 @@ impl AudioSlot {
             Self::Damage => &mut audio.damage,
             Self::Death => &mut audio.death,
             Self::Downed => &mut audio.downed,
+            Self::Jump => &mut audio.jump,
             Self::Footsteps => &mut audio.footsteps,
         }
     }
@@ -1386,11 +1561,19 @@ fn action_label(action: &PossessionAction) -> &'static str {
 }
 
 fn load_preview(context: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+    load_preview_named(context, path, "visual_preview")
+}
+
+fn load_preview_named(
+    context: &egui::Context,
+    path: &Path,
+    texture_name: &'static str,
+) -> Option<egui::TextureHandle> {
     let image = load_visual_image(path)?;
     let rgba = image.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Some(context.load_texture(
-        "visual_preview",
+        texture_name,
         egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
         egui::TextureOptions::LINEAR,
     ))

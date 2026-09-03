@@ -8,9 +8,9 @@ use thiserror::Error;
 use crate::catalog::{DRGBASE_BASELINE_COMMIT, property_catalog};
 use crate::converter::{self, ConversionError};
 use crate::domain::{
-    ATTACK_ACTIVITIES, BindTrigger, DAMAGE_TYPES, HookActionKind, HookEvent, Nextbot,
-    POSSESSION_KEYS, PossessionAction, Project, PropertyValue, SpawnTab, format_number, lua_string,
-    sanitize_class_name, slugify,
+    ATTACK_ACTIVITIES, BindTrigger, DAMAGE_TYPES, HookActionKind, HookEvent, KillfeedIconMode,
+    Nextbot, POSSESSION_KEYS, PossessionAction, Project, PropertyValue, SpawnTab, format_number,
+    lua_string, sanitize_class_name, slugify,
 };
 use crate::{APP_VERSION, PROJECT_FILE};
 
@@ -96,6 +96,14 @@ pub fn validate_project(project: &Project) -> Result<Vec<String>, GenerationErro
         if matches!(bot.base, crate::domain::BaseVariant::Sprite) && bot.visual.source.is_none() {
             warnings.push(format!(
                 "{} has no visual asset and will use the base placeholder.",
+                bot.display_name
+            ));
+        }
+        if matches!(bot.visual.killfeed_icon.mode, KillfeedIconMode::CustomImage)
+            && bot.visual.killfeed_icon.source.is_none()
+        {
+            warnings.push(format!(
+                "{} uses a custom killfeed icon but no image is selected.",
                 bot.display_name
             ));
         }
@@ -238,6 +246,35 @@ pub fn generate_project(
             }
         }
 
+        let killfeed_source = match bot.visual.killfeed_icon.mode {
+            KillfeedIconMode::NextbotSprite => bot.visual.source.as_ref(),
+            KillfeedIconMode::CustomImage => bot.visual.killfeed_icon.source.as_ref(),
+        };
+        let mut killfeed_material = None;
+        if let Some(source) = killfeed_source {
+            if source.is_file() {
+                let material = format!("{material_relative}_killfeed");
+                let artifact = converter::convert_killfeed_icon(
+                    source,
+                    &project.root.join("materials"),
+                    &material,
+                )?;
+                for path in [&artifact.vtf_path, &artifact.vmt_path] {
+                    if let Ok(relative) = path.strip_prefix(&project.root) {
+                        generated.insert(relative.to_path_buf());
+                    }
+                }
+                written += 2;
+                killfeed_material = Some(material);
+            } else {
+                warnings.push(format!(
+                    "{}: killfeed icon source is missing: {}",
+                    bot.display_name,
+                    source.display()
+                ));
+            }
+        }
+
         let sound_names =
             convert_bot_audio(project, bot, portable_root, &mut generated, &mut written)?;
         sound_entries.push_str(&render_sound_entries(bot, &sound_names));
@@ -246,7 +283,7 @@ pub fn generate_project(
         write_generated(
             project,
             &entity_folder.join("shared.lua"),
-            render_shared(project, bot, &sound_names).into_bytes(),
+            render_shared(project, bot, &sound_names, killfeed_material.as_deref()).into_bytes(),
             &mut generated,
             &mut written,
         )?;
@@ -328,7 +365,7 @@ pub fn generate_project(
                 .is_some_and(|extension| {
                     matches!(
                         extension.to_ascii_lowercase().as_str(),
-                        "vmt" | "png" | "wav"
+                        "vtf" | "vmt" | "png" | "wav"
                     )
                 })
         })
@@ -380,6 +417,7 @@ struct SoundNames {
     damage: Option<String>,
     death: Option<String>,
     downed: Option<String>,
+    jump: Option<String>,
     footsteps: Option<String>,
     waves: BTreeMap<String, Vec<String>>,
 }
@@ -398,6 +436,7 @@ fn convert_bot_audio(
         ("damage", &bot.audio.damage),
         ("death", &bot.audio.death),
         ("downed", &bot.audio.downed),
+        ("jump", &bot.audio.jump),
         ("footsteps", &bot.audio.footsteps),
     ] {
         if sources.is_empty() {
@@ -429,6 +468,7 @@ fn convert_bot_audio(
             "damage" => result.damage = Some(logical.clone()),
             "death" => result.death = Some(logical.clone()),
             "downed" => result.downed = Some(logical.clone()),
+            "jump" => result.jump = Some(logical.clone()),
             "footsteps" => result.footsteps = Some(logical.clone()),
             _ => {}
         }
@@ -465,7 +505,12 @@ fn render_sound_entries(bot: &Nextbot, sounds: &SoundNames) -> String {
     output
 }
 
-fn render_shared(project: &Project, bot: &Nextbot, sounds: &SoundNames) -> String {
+fn render_shared(
+    project: &Project,
+    bot: &Nextbot,
+    sounds: &SoundNames,
+    killfeed_material: Option<&str>,
+) -> String {
     let mut output = lua_header(project, bot);
     output.push_str("if not DrGBase then return end\n\n");
     output.push_str(&format!(
@@ -485,7 +530,12 @@ fn render_shared(project: &Project, bot: &Nextbot, sounds: &SoundNames) -> Strin
         output.push_str(&format!("-- {} --\n", section.label()));
         for field in fields {
             if let Some(value) = bot.properties.get(field.name) {
-                output.push_str(&format!("ENT.{} = {}\n", field.name, value.to_lua()));
+                let value = if field.name == "IdleSoundDelay" && bot.audio.idle_loop {
+                    "0".to_owned()
+                } else {
+                    value.to_lua()
+                };
+                output.push_str(&format!("ENT.{} = {}\n", field.name, value));
             }
         }
         output.push('\n');
@@ -511,6 +561,7 @@ fn render_shared(project: &Project, bot: &Nextbot, sounds: &SoundNames) -> Strin
         "ENT.OnDownedSounds = {}\n",
         sound_list(&sounds.downed)
     ));
+    output.push_str(&format!("ENT.JumpSounds = {}\n", sound_list(&sounds.jump)));
     output.push_str(&format!(
         "ENT.Footsteps = {}\n\n",
         sounds
@@ -519,7 +570,18 @@ fn render_shared(project: &Project, bot: &Nextbot, sounds: &SoundNames) -> Strin
             .map(|name| format!("{{[MAT_DEFAULT] = {{{}}}}}", lua_string(name)))
             .unwrap_or_else(|| "{}".into())
     ));
+    if let Some(material) = killfeed_material {
+        output.push_str(&format!(
+            "if CLIENT then\n    ENT.Killicon = {{icon = {}, color = Color(255, 255, 255, 255)}}\nend\n\n",
+            lua_string(material)
+        ));
+    }
     output.push_str(&render_possession(bot));
+    if sounds.jump.is_some() {
+        output.push_str(
+            "\nif SERVER then\n    function ENT:OnLeaveGround()\n        if #self.JumpSounds > 0 then\n            self:EmitSound(table.Random(self.JumpSounds))\n        end\n    end\nend\n",
+        );
+    }
     output.push_str("\nDrGBase.AddNextbot(ENT)\n");
     output.push_str(&render_spawn_registration(bot));
     output
@@ -631,7 +693,6 @@ fn render_server(bot: &Nextbot) -> String {
             format_number(bot.combat.ranged_speed as f64)
         ));
     }
-
     let mut bodies: BTreeMap<HookEvent, Vec<String>> = BTreeMap::new();
     if bot.hooks.patrol_when_idle {
         bodies.entry(HookEvent::OnIdle).or_default().push(format!(
@@ -938,7 +999,7 @@ mod tests {
         let root = std::env::temp_dir().join("nbc_generator_test");
         let mut project = Project::new("Example", root);
         project.nextbots[0].admin_only = true;
-        let shared = render_shared(&project, &project.nextbots[0], &SoundNames::default());
+        let shared = render_shared(&project, &project.nextbots[0], &SoundNames::default(), None);
         assert!(shared.starts_with(&format!(
             "-- This nextbot was created by NextbotCreator {APP_VERSION}"
         )));
@@ -955,7 +1016,7 @@ mod tests {
     fn all_documented_properties_are_emitted() {
         let root = std::env::temp_dir().join("nbc_generator_catalog_test");
         let project = Project::new("Example", root);
-        let shared = render_shared(&project, &project.nextbots[0], &SoundNames::default());
+        let shared = render_shared(&project, &project.nextbots[0], &SoundNames::default(), None);
         for property in property_catalog() {
             assert!(
                 shared.contains(&format!("ENT.{} =", property.name)),
@@ -1013,5 +1074,46 @@ mod tests {
             validate_project(&project),
             Err(GenerationError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn killfeed_material_and_jump_sound_hooks_are_emitted() {
+        let root = std::env::temp_dir().join("nbc_generator_media_test");
+        let project = Project::new("Example", root);
+        let mut bot = project.nextbots[0].clone();
+        bot.audio.jump.push(PathBuf::from("jump.mp3"));
+        let sounds = SoundNames {
+            jump: Some("nbc.example.npc_my_nextbot.jump".into()),
+            ..SoundNames::default()
+        };
+        let shared = render_shared(
+            &project,
+            &bot,
+            &sounds,
+            Some("nextbotcreator/example/npc_my_nextbot/killfeed"),
+        );
+        assert!(shared.contains("ENT.JumpSounds = {\"nbc.example.npc_my_nextbot.jump\"}"));
+        assert!(
+            shared.contains(
+                "ENT.Killicon = {icon = \"nextbotcreator/example/npc_my_nextbot/killfeed\""
+            )
+        );
+        assert!(shared.contains("function ENT:OnLeaveGround()"));
+        assert!(shared.contains("table.Random(self.JumpSounds)"));
+        assert!(
+            shared.find("function ENT:OnLeaveGround()").unwrap()
+                < shared.find("DrGBase.AddNextbot(ENT)").unwrap()
+        );
+    }
+
+    #[test]
+    fn idle_loop_removes_the_delay_between_idle_sounds() {
+        let root = std::env::temp_dir().join("nbc_generator_idle_loop_test");
+        let project = Project::new("Example", root);
+        let mut bot = project.nextbots[0].clone();
+        bot.audio.idle_loop = true;
+        let shared = render_shared(&project, &bot, &SoundNames::default(), None);
+        assert!(shared.contains("ENT.IdleSoundDelay = 0"));
+        assert!(!shared.contains("ENT.IdleSoundDelay = 2"));
     }
 }

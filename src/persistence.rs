@@ -31,6 +31,8 @@ pub enum PersistenceError {
 pub struct AppSettings {
     pub projects_root: PathBuf,
     pub garrys_mod_root: Option<PathBuf>,
+    #[serde(default)]
+    pub recent_projects: Vec<PathBuf>,
 }
 
 impl AppSettings {
@@ -42,9 +44,15 @@ impl AppSettings {
             .unwrap_or_else(|| Self {
                 projects_root: portable_root.join("projects"),
                 garrys_mod_root: None,
+                recent_projects: Vec::new(),
             });
         if settings.projects_root.is_relative() {
             settings.projects_root = portable_root.join(&settings.projects_root);
+        }
+        for project in &mut settings.recent_projects {
+            if project.is_relative() {
+                *project = portable_root.join(&*project);
+            }
         }
         settings
     }
@@ -55,8 +63,49 @@ impl AppSettings {
         if let Ok(relative) = portable.projects_root.strip_prefix(portable_root) {
             portable.projects_root = relative.to_path_buf();
         }
+        for project in &mut portable.recent_projects {
+            if let Ok(relative) = project.strip_prefix(portable_root) {
+                *project = relative.to_path_buf();
+            }
+        }
         write_json(&path, &portable)
     }
+
+    pub fn remember_project(&mut self, path: &Path) {
+        let project_root = if path.file_name().is_some_and(|name| name == PROJECT_FILE) {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        let project_root = project_root.to_path_buf();
+        self.recent_projects.retain(|existing| {
+            existing.join(PROJECT_FILE).is_file() && !same_path(existing, &project_root)
+        });
+        self.recent_projects.insert(0, project_root);
+        self.recent_projects.truncate(12);
+    }
+
+    pub fn available_projects(&self) -> Vec<PathBuf> {
+        let mut projects: Vec<PathBuf> = Vec::new();
+        for path in self
+            .recent_projects
+            .iter()
+            .cloned()
+            .chain(discover_projects(&self.projects_root))
+        {
+            if path.join(PROJECT_FILE).is_file()
+                && !projects.iter().any(|existing| same_path(existing, &path))
+            {
+                projects.push(path);
+            }
+        }
+        projects
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 pub fn portable_root() -> PathBuf {
@@ -225,12 +274,16 @@ fn visit_asset_paths_mut(project: &mut Project, mut visit: impl FnMut(&mut PathB
         if let Some(source) = &mut bot.visual.source {
             visit(source);
         }
+        if let Some(source) = &mut bot.visual.killfeed_icon.source {
+            visit(source);
+        }
         for paths in [
             &mut bot.audio.spawn,
             &mut bot.audio.idle,
             &mut bot.audio.damage,
             &mut bot.audio.death,
             &mut bot.audio.downed,
+            &mut bot.audio.jump,
             &mut bot.audio.footsteps,
         ] {
             for path in paths {
@@ -260,7 +313,9 @@ mod tests {
         fs::write(&source, b"test").unwrap();
         let mut project = project;
         project.nextbots[0].visual.source = Some(source.clone());
+        project.nextbots[0].visual.killfeed_icon.source = Some(source.clone());
         project.nextbots[0].audio.spawn.push(source.clone());
+        project.nextbots[0].audio.jump.push(source.clone());
         save_project(&project).unwrap();
         let persisted = fs::read_to_string(project.root.join(PROJECT_FILE)).unwrap();
         assert!(!persisted.contains(&project.root.display().to_string()));
@@ -268,7 +323,12 @@ mod tests {
         assert_eq!(loaded.name, "Test Bot Pack");
         assert_eq!(loaded.root, project.root);
         assert_eq!(loaded.nextbots[0].visual.source.as_ref(), Some(&source));
+        assert_eq!(
+            loaded.nextbots[0].visual.killfeed_icon.source.as_ref(),
+            Some(&source)
+        );
         assert_eq!(loaded.nextbots[0].audio.spawn, vec![source]);
+        assert_eq!(loaded.nextbots[0].audio.jump.len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -282,6 +342,7 @@ mod tests {
         let settings = AppSettings {
             projects_root: root.join("projects"),
             garrys_mod_root: Some(PathBuf::from(r"C:\Games\GarrysMod\garrysmod")),
+            recent_projects: vec![root.join("projects").join("recent")],
         };
         settings.save(&root).unwrap();
         let persisted = fs::read_to_string(root.join("settings.json")).unwrap();
@@ -289,6 +350,28 @@ mod tests {
         let loaded = AppSettings::load_or_default(&root);
         assert_eq!(loaded.projects_root, root.join("projects"));
         assert_eq!(loaded.garrys_mod_root, settings.garrys_mod_root);
+        assert_eq!(loaded.recent_projects, settings.recent_projects);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remembered_projects_are_most_recent_first_and_deduplicated() {
+        let root = temp_folder("recent_projects");
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir_all(&root).unwrap();
+        let first = create_project(&root, "First").unwrap();
+        let second = create_project(&root, "Second").unwrap();
+        let mut settings = AppSettings {
+            projects_root: root.clone(),
+            garrys_mod_root: None,
+            recent_projects: Vec::new(),
+        };
+        settings.remember_project(&first.root);
+        settings.remember_project(&second.root);
+        settings.remember_project(&first.root);
+        assert_eq!(settings.available_projects(), vec![first.root, second.root]);
         fs::remove_dir_all(root).unwrap();
     }
 }

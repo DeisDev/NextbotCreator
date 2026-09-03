@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [NextbotCreator]
 
+## [0.4.0] - 2026-09-03
+
+### Added
+
+- Optional continuous idle-sound looping with the configured idle delay preserved when disabled.
+
+## [0.3.1] - 2026-09-03
+
+### Changed
+
+- Reduced the Chase preset's movement speed so sprinting players have a chance to escape.
+
+## [0.3.0] - 2026-09-03
+
+### Added
+
+- Static killfeed icon generation from the NextBot sprite or a separate custom image.
+- Friendly, aggressive, hostile, and relentless one-hit chase behavior presets.
+- Portable recent-project history, including projects opened outside the default projects folder.
+- Configurable jump sound effects with automatic Source-compatible audio conversion.
+
 ## [0.2.0] - 2026-09-03
 
 ### Added
