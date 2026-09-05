@@ -328,7 +328,7 @@ impl CreatorApp {
             integration::create_junction(gmod, &project.slug, &project.root)
         };
         match result {
-            Ok(path) if unlink => self.set_status("Project unlinked from Garry's Mod."),
+            Ok(_) if unlink => self.set_status("Project unlinked from Garry's Mod."),
             Ok(path) => self.set_status(format!("Project linked at {}", path.display())),
             Err(error) => self.set_error(error),
         }
@@ -2438,17 +2438,17 @@ fn configure_theme(context: &egui::Context) {
     visuals.faint_bg_color = Color32::from_rgb(33, 36, 44);
     visuals.weak_text_color = Some(ui::MUTED);
     visuals.selection.bg_fill = Color32::from_rgb(57, 43, 64);
-    visuals.selection.stroke = egui::Stroke::new(1.0, Color32::from_rgb(243, 193, 235));
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(243, 193, 235));
     visuals.hyperlink_color = accent();
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, ui::BORDER);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, ui::BORDER);
     visuals.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(228, 232, 240);
     visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(213, 219, 230);
     visuals.widgets.inactive.bg_fill = Color32::from_rgb(36, 40, 49);
     visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(36, 40, 49);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(62, 67, 81));
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(62, 67, 81));
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(47, 51, 63);
     visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(47, 51, 63);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent().gamma_multiply(0.65));
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, accent().gamma_multiply(0.65));
     visuals.widgets.active.bg_fill = Color32::from_rgb(77, 46, 78);
     for widgets in [
         &mut visuals.widgets.inactive,
@@ -2516,7 +2516,7 @@ fn primary_button(label: &str) -> egui::Button<'_> {
 fn card_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(ui::SURFACE)
-        .stroke(egui::Stroke::new(1.0, ui::BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, ui::BORDER))
         .corner_radius(8)
         .inner_margin(20)
 }

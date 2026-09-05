@@ -395,7 +395,7 @@ pub(super) fn external_link(ui: &mut egui::Ui, label: &str, url: &str) {
 pub(super) fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, id: egui::Id) {
     egui::Frame::new()
         .fill(ui.visuals().extreme_bg_color)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
