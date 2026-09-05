@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
+use crate::media_dialog::{MediaDialog, MediaTarget};
 use nextbot_creator::catalog::{PropertySection, PropertySpec, property_catalog};
 use nextbot_creator::converter;
 use nextbot_creator::domain::{
@@ -91,6 +92,8 @@ pub struct CreatorApp {
     updates: UpdateChecker,
     show_updates: bool,
     update_notice_dismissed: bool,
+    media_dialog: Option<MediaDialog>,
+    downloader_update: Option<nextbot_creator::media::MediaJob<String>>,
 }
 
 impl CreatorApp {
@@ -141,6 +144,8 @@ impl CreatorApp {
             updates,
             show_updates: false,
             update_notice_dismissed: false,
+            media_dialog: None,
+            downloader_update: None,
         }
     }
 
@@ -176,7 +181,11 @@ impl CreatorApp {
     }
 
     fn generate(&mut self) {
-        if self.generation.is_some() || self.project.is_none() || !self.save() {
+        if self.media_dialog.is_some()
+            || self.generation.is_some()
+            || self.project.is_none()
+            || !self.save()
+        {
             return;
         }
         let project = self.project.as_ref().unwrap().clone();
@@ -225,7 +234,11 @@ impl CreatorApp {
     }
 
     fn request_leave(&mut self, action: LeaveAction, context: &egui::Context) {
-        if self.generation.is_some() {
+        if self.downloader_update.is_some() {
+            self.set_status("Finish or cancel the downloader update before closing.");
+        } else if self.media_dialog.is_some() {
+            self.set_status("Finish or cancel the media import before closing the project.");
+        } else if self.generation.is_some() {
             self.set_status("Finish generating before closing the project.");
         } else if self.is_dirty() {
             self.leave_action = Some(action);
@@ -428,6 +441,116 @@ impl CreatorApp {
         }
     }
 
+    fn open_media(&mut self, target: MediaTarget) {
+        if self.downloader_update.is_some() {
+            self.set_status("Wait for the downloader update to finish.");
+            return;
+        }
+        if self.generation.is_some() || self.media_dialog.is_some() {
+            return;
+        }
+        let Some(project) = &self.project else {
+            return;
+        };
+        let Some(bot) = project.nextbots.get(self.selected_bot) else {
+            return;
+        };
+        let mut dialog = MediaDialog::new(target, project.root.clone(), bot.class_name.clone());
+        if let MediaTarget::Audio {
+            slot,
+            index: Some(index),
+        } = target
+        {
+            let Some(clip) = slot.get(&bot.audio).get(index) else {
+                return;
+            };
+            dialog.edit(clip.clone(), &self.portable_root);
+        }
+        self.media_dialog = Some(dialog);
+    }
+
+    fn show_media(&mut self, context: &egui::Context) {
+        let Some(mut dialog) = self.media_dialog.take() else {
+            return;
+        };
+        if dialog.show(context, &self.portable_root) {
+            match self.accept_media(&dialog) {
+                Ok(()) => {
+                    self.preview = None;
+                    self.killfeed_preview = None;
+                    self.set_status("Media updated. The original source is preserved; conversion and trimming are applied when generating.");
+                    return;
+                }
+                Err(error) => dialog.error = error,
+            }
+        }
+        if !dialog.closed {
+            self.media_dialog = Some(dialog);
+        }
+    }
+
+    fn accept_media(&mut self, dialog: &MediaDialog) -> Result<(), String> {
+        let project = self
+            .project
+            .as_mut()
+            .ok_or("The project is no longer open.")?;
+        if project.root != dialog.project_root {
+            return Err("The active project changed. Reopen the import dialog.".into());
+        }
+        let index = project
+            .nextbots
+            .iter()
+            .position(|bot| bot.class_name == dialog.bot_class)
+            .ok_or("The selected NextBot is no longer available.")?;
+        let prepared = dialog
+            .prepared
+            .as_ref()
+            .ok_or("Media has not finished downloading.")?;
+        if let Some(audio) = &prepared.audio {
+            dialog.trim.range(audio.duration).map_err(str::to_owned)?;
+        }
+        if let MediaTarget::Audio {
+            slot,
+            index: Some(clip_index),
+        } = dialog.target
+        {
+            let clip = slot
+                .get_mut(&mut project.nextbots[index].audio)
+                .get_mut(clip_index)
+                .ok_or("This clip was removed.")?;
+            if Some(&*clip) != dialog.original_clip.as_ref() {
+                return Err("This clip changed. Reopen the trim editor.".into());
+            }
+            clip.trim = dialog.trim;
+            return Ok(());
+        }
+        let source = persistence::import_source_asset(project, &dialog.bot_class, &prepared.source)
+            .map_err(|error| error.to_string())?;
+        let bot = &mut project.nextbots[index];
+        match dialog.target {
+            MediaTarget::Visual => {
+                if let Some((width, height)) = visual_dimensions(&source) {
+                    bot.visual.width = (bot.visual.height * width as f32 / height.max(1) as f32)
+                        .clamp(1.0, 4096.0);
+                }
+                bot.visual.source = Some(source);
+            }
+            MediaTarget::Killfeed => {
+                bot.visual.killfeed_icon.source = Some(source);
+                bot.visual.killfeed_icon.mode = KillfeedIconMode::CustomImage;
+            }
+            MediaTarget::Audio { slot, .. } => {
+                slot.get_mut(&mut bot.audio)
+                    .push(nextbot_creator::domain::AudioClip {
+                        source,
+                        trim: dialog.trim,
+                        source_url: prepared.source_url.clone(),
+                    });
+            }
+        }
+        Ok(())
+    }
+
     fn import_audio(&mut self, slot: AudioSlot) {
         let Some(project) = self.project.as_mut() else {
             return;
@@ -456,7 +579,8 @@ impl CreatorApp {
             }
         }
         if let Some(bot) = project.nextbots.get_mut(self.selected_bot) {
-            slot.get_mut(&mut bot.audio).extend(imported);
+            slot.get_mut(&mut bot.audio)
+                .extend(imported.into_iter().map(Into::into));
         }
         self.set_status(
             "Audio imported. It will be normalized to mono 44.1 kHz PCM WAV when generated.",
@@ -659,6 +783,17 @@ impl CreatorApp {
             .default_width(420.0)
             .show(context, |ui| {
                 ui.label(format!("Installed version: {APP_VERSION}"));
+                ui.separator();
+                ui.label("Media download tools");
+                ui.label(RichText::new("Update the downloader if YouTube or TikTok imports stop working.").small().weak());
+                if let Some(job) = &self.downloader_update {
+                    ui.horizontal(|ui| { ui.spinner(); ui.label(job.context.progress()); });
+                    if ui.button("Cancel downloader update").clicked() { job.context.cancel(); }
+                } else if ui.add_enabled(self.media_dialog.is_none(), egui::Button::new("Update downloader")).clicked() {
+                    let root = self.portable_root.clone();
+                    self.downloader_update = Some(nextbot_creator::media::MediaJob::start(move |context| nextbot_creator::media_tools::update_downloader(&root, &context)));
+                }
+                ui.separator();
                 let previous = self.settings.check_for_updates_on_startup;
                 if ui.checkbox(&mut self.settings.check_for_updates_on_startup, "Check for updates at startup").changed() {
                     match self.settings.save(&self.portable_root) {
@@ -1217,6 +1352,9 @@ impl CreatorApp {
         if ui.button("Import visual asset…").clicked() {
             self.import_visual(context);
         }
+        if ui.button("Paste image URL...").clicked() {
+            self.open_media(MediaTarget::Visual);
+        }
         if let Some((_, texture)) = &self.preview {
             card_frame().show(ui, |ui| {
                 ui.add(egui::Image::new(texture).max_size(egui::vec2(240.0, 240.0)));
@@ -1326,9 +1464,13 @@ impl CreatorApp {
         let custom_mode = matches!(bot.visual.killfeed_icon.mode, KillfeedIconMode::CustomImage);
         let custom_source = bot.visual.killfeed_icon.source.clone();
         let mut import_custom = false;
+        let mut import_custom_url = false;
         if custom_mode {
             if ui.button("Import custom killfeed image...").clicked() {
                 import_custom = true;
+            }
+            if ui.button("Paste killfeed image URL...").clicked() {
+                import_custom_url = true;
             }
             if let Some(source) = &custom_source {
                 path_label(ui, source);
@@ -1344,6 +1486,9 @@ impl CreatorApp {
         }
         if import_custom {
             self.import_killfeed_icon(context);
+        }
+        if import_custom_url {
+            self.open_media(MediaTarget::Killfeed);
         }
         if let Some((_, texture)) = &self.killfeed_preview {
             ui.add(egui::Image::new(texture).max_size(egui::vec2(128.0, 128.0)));
@@ -1434,6 +1579,9 @@ impl CreatorApp {
                             if ui.small_button("+ Add files").clicked() {
                                 self.import_audio(slot);
                             }
+                            if ui.small_button("Paste link...").clicked() {
+                                self.open_media(MediaTarget::Audio { slot, index: None });
+                            }
                         });
                     });
                     ui.label(RichText::new(slot.description()).small().weak());
@@ -1442,6 +1590,7 @@ impl CreatorApp {
                     };
                     let files = slot.get_mut(&mut bot.audio);
                     let mut remove = None;
+                    let mut edit = None;
                     for (index, file) in files.iter().enumerate() {
                         ui.push_id(index, |ui| {
                             ui.horizontal(|ui| {
@@ -1451,15 +1600,22 @@ impl CreatorApp {
                                         if ui.small_button("Remove").clicked() {
                                             remove = Some(index);
                                         }
+                                        if ui.small_button("Preview / trim").clicked() {
+                                            edit = Some(index);
+                                        }
+                                        if file.trim != Default::default() {
+                                            ui.small("Trimmed");
+                                        }
                                         ui.add(
                                             egui::Label::new(
-                                                file.file_name()
+                                                file.source
+                                                    .file_name()
                                                     .and_then(|name| name.to_str())
                                                     .unwrap_or("audio"),
                                             )
                                             .truncate(),
                                         )
-                                        .on_hover_text(file.display().to_string());
+                                        .on_hover_text(file.source.display().to_string());
                                     },
                                 );
                             });
@@ -1467,6 +1623,14 @@ impl CreatorApp {
                     }
                     if let Some(index) = remove {
                         files.remove(index);
+                    }
+                    if remove.is_none()
+                        && let Some(index) = edit
+                    {
+                        self.open_media(MediaTarget::Audio {
+                            slot,
+                            index: Some(index),
+                        });
                     }
                 });
             });
@@ -1832,6 +1996,20 @@ impl eframe::App for CreatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         self.poll_generation(&context);
+        if let Some(result) = self
+            .downloader_update
+            .as_mut()
+            .and_then(nextbot_creator::media::MediaJob::poll)
+        {
+            self.downloader_update = None;
+            match result {
+                Ok(message) => self.set_status(message),
+                Err(error) => self.set_error(error),
+            }
+        }
+        if self.downloader_update.is_some() {
+            context.request_repaint_after(Duration::from_millis(100));
+        }
         if self.updates.poll() {
             self.update_notice_dismissed = false;
         }
@@ -1840,12 +2018,15 @@ impl eframe::App for CreatorApp {
         }
         if context.input(|input| input.viewport().close_requested())
             && !self.allow_close
-            && (self.is_dirty() || self.generation.is_some())
+            && (self.is_dirty()
+                || self.generation.is_some()
+                || self.media_dialog.is_some()
+                || self.downloader_update.is_some())
         {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.request_leave(LeaveAction::Close, &context);
         }
-        if self.leave_action.is_none() && self.generation.is_none() {
+        if self.leave_action.is_none() && self.generation.is_none() && self.media_dialog.is_none() {
             if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
                 self.save();
             }
@@ -1869,6 +2050,7 @@ impl eframe::App for CreatorApp {
         }
         self.leave_dialog(&context);
         self.updates_window(&context);
+        self.show_media(&context);
     }
 }
 
@@ -2232,6 +2414,8 @@ mod tests {
             updates: UpdateChecker::default(),
             show_updates: false,
             update_notice_dismissed: false,
+            media_dialog: None,
+            downloader_update: None,
         }
     }
 
@@ -2248,6 +2432,45 @@ mod tests {
         app.leave_project(LeaveAction::Home, &context); // Explicit discard.
         assert!(app.project.is_none());
         assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn accepting_a_trim_updates_only_the_original_clip_and_rejects_stale_edits() {
+        let mut app = app_for_test("trim_target");
+        let original: nextbot_creator::domain::AudioClip = PathBuf::from("original.wav").into();
+        let project = app.project.as_mut().unwrap();
+        project.nextbots[0].audio.spawn.push(original.clone());
+        let mut dialog = MediaDialog::new(
+            MediaTarget::Audio {
+                slot: AudioSlot::Spawn,
+                index: Some(0),
+            },
+            project.root.clone(),
+            project.nextbots[0].class_name.clone(),
+        );
+        dialog.original_clip = Some(original.clone());
+        dialog.trim = nextbot_creator::domain::AudioTrim {
+            start: 1.0,
+            end: Some(2.0),
+        };
+        dialog.prepared = Some(nextbot_creator::media::PreparedMedia {
+            source: original.source.clone(),
+            title: "Original".into(),
+            source_url: None,
+            audio: Some(nextbot_creator::audio::AudioPreview {
+                path: PathBuf::from("unused.wav"),
+                duration: 4.0,
+                peaks: vec![[0.0, 0.1]],
+            }),
+            image: None,
+            workspace: tempfile::tempdir().unwrap(),
+        });
+        app.accept_media(&dialog).unwrap();
+        let clip = &app.project.as_ref().unwrap().nextbots[0].audio.spawn[0];
+        assert_eq!(clip.source, original.source);
+        assert_eq!(clip.trim, dialog.trim);
+        assert!(app.accept_media(&dialog).is_err());
+        assert!(app.is_dirty());
     }
 
     #[test]

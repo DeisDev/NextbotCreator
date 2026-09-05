@@ -27,6 +27,8 @@ pub enum ConversionError {
     FfmpegMissing,
     #[error("audio conversion failed: {0}")]
     FfmpegFailed(String),
+    #[error("invalid audio clip: {0}")]
+    InvalidAudio(String),
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +308,18 @@ pub fn convert_audio(
     destination: &Path,
     portable_root: &Path,
 ) -> Result<(), ConversionError> {
+    convert_audio_clip(&source.to_path_buf().into(), destination, portable_root)
+}
+
+pub fn convert_audio_clip(
+    clip: &crate::domain::AudioClip,
+    destination: &Path,
+    portable_root: &Path,
+) -> Result<(), ConversionError> {
+    clip.trim
+        .validate()
+        .map_err(|error| ConversionError::InvalidAudio(error.into()))?;
+    let source = &clip.source;
     let ffmpeg = ffmpeg_path(portable_root).ok_or(ConversionError::FfmpegMissing)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|source| ConversionError::Io {
@@ -315,10 +329,37 @@ pub fn convert_audio(
     }
     let mut command = Command::new(ffmpeg);
     command
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-i",
+        ])
         .arg(source)
-        .args(["-vn", "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le"])
-        .arg(destination);
+        .args([
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            "-c:a",
+            "pcm_s16le",
+        ]);
+    if clip.trim.start > 0.0 {
+        command.arg("-ss").arg(format!("{:.9}", clip.trim.start));
+    }
+    if let Some(end) = clip.trim.end {
+        command
+            .arg("-t")
+            .arg(format!("{:.9}", end - clip.trim.start));
+    }
+    command.arg(destination);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -331,6 +372,19 @@ pub fn convert_audio(
     if !output.status.success() {
         return Err(ConversionError::FfmpegFailed(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let wave = hound::WavReader::open(destination)
+        .map_err(|error| ConversionError::InvalidAudio(error.to_string()))?;
+    let duration = f64::from(wave.duration()) / f64::from(wave.spec().sample_rate);
+    if duration <= 0.0
+        || clip
+            .trim
+            .end
+            .is_some_and(|end| duration + 0.001 < end - clip.trim.start)
+    {
+        return Err(ConversionError::InvalidAudio(
+            "Trim extends beyond the source audio. Open Preview / trim and adjust it.".into(),
         ));
     }
     Ok(())

@@ -4,6 +4,8 @@ A portable Windows GUI for creating and testing Garry's Mod NextBots based on DR
 
 ## Build
 
-Install stable Rust, then run `cargo build --release --locked`. Run `scripts/package.ps1` to create the portable Windows x64 folder and compressed ZIP with FFmpeg and a SHA-256 checksum included. Use `scripts/package.ps1 -SkipFfmpeg` for an app-only ZIP; audio conversion requires the existing `tools/ffmpeg.exe`.
+Install stable Rust, then run `cargo build --release --locked`. Run `scripts/package.ps1` to create the portable Windows x64 folder and compressed ZIP with FFmpeg, FFprobe, yt-dlp, Deno, and a SHA-256 checksum included. Use `scripts/package.ps1 -SkipTools` (or `-SkipFfmpeg`) for an app-only ZIP that reuses your existing `tools` folder.
 
-Upload the ZIP and its `.sha256` file to [GitHub Releases](https://github.com/DeisDev/NextbotCreator/releases). Publish stable releases with a matching version tag such as `v0.6.0`. The app checks the latest published stable release in the background at startup; disable this or check manually under **Updates**. To update, close the app and copy the new bundle's contents into your existing portable folder, retaining `settings.json`, `projects`, and `tools`.
+Use **Paste link** in a sound slot for public YouTube/TikTok videos, or **Paste image URL** for direct images and GIFs. **Preview / trim** supports playback, waveform seeking, and reversible start/end edits for local and downloaded audio. Sources stay inside the project; conversion and trimming are applied automatically when generating. Use **Updates > Update downloader** if video imports stop working.
+
+Upload the ZIP and its `.sha256` file to [GitHub Releases](https://github.com/DeisDev/NextbotCreator/releases). Publish stable releases with a matching version tag such as `v0.7.0`. The app checks the latest published stable release in the background at startup; disable this or check manually under **Updates**. To update, close the app and copy the new bundle's contents into your existing portable folder, retaining `settings.json`, `projects`, and `tools`.

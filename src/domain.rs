@@ -31,7 +31,7 @@ impl Project {
         let name = name.into();
         let slug = slugify(&name);
         Self {
-            format_version: 1,
+            format_version: 2,
             name,
             slug,
             author: String::new(),
@@ -475,30 +475,117 @@ pub enum KillfeedIconMode {
     CustomImage,
 }
 
+/// Source audio is retained; trimming is applied only when generating the addon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "AudioClipInput")]
+pub struct AudioClip {
+    pub source: PathBuf,
+    pub trim: AudioTrim,
+    pub source_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct AudioTrim {
+    #[serde(default)]
+    pub start: f64,
+    pub end: Option<f64>,
+}
+
+impl AudioTrim {
+    pub fn validate(self) -> Result<(), &'static str> {
+        if !self.start.is_finite() || self.start < 0.0 {
+            return Err("Clip start must be a finite, non-negative time.");
+        }
+        if self
+            .end
+            .is_some_and(|end| !end.is_finite() || end <= self.start)
+        {
+            return Err("Clip end must be later than its start.");
+        }
+        Ok(())
+    }
+
+    pub fn range(self, duration: f64) -> Result<(f64, f64), &'static str> {
+        self.validate()?;
+        let end = self.end.unwrap_or(duration);
+        if !duration.is_finite()
+            || duration <= 0.0
+            || self.start >= duration
+            || end > duration + 0.001
+        {
+            return Err("Clip times fall outside the source audio. Reset or adjust the trim.");
+        }
+        if end.min(duration) - self.start < (1.0 / 44100.0) - 1e-12 {
+            return Err("Select at least one sample of audio.");
+        }
+        Ok((self.start, end.min(duration)))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AudioClipInput {
+    Legacy(PathBuf),
+    Clip {
+        source: PathBuf,
+        #[serde(default)]
+        trim: AudioTrim,
+        #[serde(default)]
+        source_url: Option<String>,
+    },
+}
+
+impl From<AudioClipInput> for AudioClip {
+    fn from(value: AudioClipInput) -> Self {
+        match value {
+            AudioClipInput::Legacy(source) => source.into(),
+            AudioClipInput::Clip {
+                source,
+                trim,
+                source_url,
+            } => Self {
+                source,
+                trim,
+                source_url,
+            },
+        }
+    }
+}
+
+impl From<PathBuf> for AudioClip {
+    fn from(source: PathBuf) -> Self {
+        Self {
+            source,
+            trim: AudioTrim::default(),
+            source_url: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioSettings {
-    pub spawn: Vec<PathBuf>,
-    pub idle: Vec<PathBuf>,
+    pub spawn: Vec<AudioClip>,
+    pub idle: Vec<AudioClip>,
     #[serde(default)]
     pub idle_loop: bool,
-    pub damage: Vec<PathBuf>,
-    pub death: Vec<PathBuf>,
-    pub downed: Vec<PathBuf>,
+    pub damage: Vec<AudioClip>,
+    pub death: Vec<AudioClip>,
+    pub downed: Vec<AudioClip>,
     #[serde(default)]
-    pub jump: Vec<PathBuf>,
-    pub footsteps: Vec<PathBuf>,
+    pub jump: Vec<AudioClip>,
+    pub footsteps: Vec<AudioClip>,
     #[serde(default)]
-    pub alert: Vec<PathBuf>,
+    pub alert: Vec<AudioClip>,
     #[serde(default)]
-    pub chase: Vec<PathBuf>,
+    pub chase: Vec<AudioClip>,
     #[serde(default)]
-    pub lost_enemy: Vec<PathBuf>,
+    pub lost_enemy: Vec<AudioClip>,
     #[serde(default)]
-    pub melee: Vec<PathBuf>,
+    pub melee: Vec<AudioClip>,
     #[serde(default)]
-    pub ranged: Vec<PathBuf>,
+    pub ranged: Vec<AudioClip>,
     #[serde(default)]
-    pub land: Vec<PathBuf>,
+    pub land: Vec<AudioClip>,
     pub volume: f32,
     pub pitch: u16,
     pub sound_level: u16,
@@ -638,7 +725,7 @@ impl AudioSlot {
         }
     }
 
-    pub fn get(self, audio: &AudioSettings) -> &Vec<PathBuf> {
+    pub fn get(self, audio: &AudioSettings) -> &Vec<AudioClip> {
         match self {
             Self::Spawn => &audio.spawn,
             Self::Idle => &audio.idle,
@@ -656,7 +743,7 @@ impl AudioSlot {
         }
     }
 
-    pub fn get_mut(self, audio: &mut AudioSettings) -> &mut Vec<PathBuf> {
+    pub fn get_mut(self, audio: &mut AudioSettings) -> &mut Vec<AudioClip> {
         match self {
             Self::Spawn => &mut audio.spawn,
             Self::Idle => &mut audio.idle,

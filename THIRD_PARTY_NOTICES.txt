@@ -8,3 +8,20 @@ The distribution also includes the FFmpeg build's license as tools/ffmpeg-licens
 Binary build and checksum:
 https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip
 https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip.sha256
+
+Portable distributions include yt-dlp 2026.08.19 (with its bundled Python interpreter and EJS solver):
+https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19
+yt-dlp source is under the Unlicense; the combined Windows executable includes GPLv3+ components.
+The matching license and third-party notices are included as tools/yt-dlp-license.txt and tools/yt-dlp-third-party-licenses.txt.
+The app's explicit downloader update action installs the corresponding notices alongside each verified update.
+Source: https://github.com/yt-dlp/yt-dlp/tree/2026.08.19
+
+Portable distributions include Deno 2.9.6, licensed under MIT, to run the YouTube challenge solver:
+https://github.com/denoland/deno/releases/tag/v2.9.6
+Source: https://github.com/denoland/deno/tree/v2.9.6
+Its license is included as tools/deno-license.txt. Notices for its V8 engine and TypeScript compiler are included as tools/deno-third-party-licenses.txt.
+
+Audio preview uses rodio (MIT or Apache-2.0), cpal (Apache-2.0), and hound (Apache-2.0).
+https://github.com/RustAudio/rodio
+https://github.com/RustAudio/cpal
+https://github.com/ruuda/hound

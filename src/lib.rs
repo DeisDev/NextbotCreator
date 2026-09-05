@@ -1,8 +1,11 @@
+pub mod audio;
 pub mod catalog;
 pub mod converter;
 pub mod domain;
 pub mod generator;
 pub mod integration;
+pub mod media;
+pub mod media_tools;
 pub mod persistence;
 pub mod updates;
 

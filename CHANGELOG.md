@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [NextbotCreator]
 
+## [0.7.0] - 2026-09-05
+
+### Added
+
+- Public YouTube and TikTok audio imports with background downloads, progress, cancellation, and portable source storage.
+- Audio playback and reversible trimming for local and downloaded clips, with waveform handles, seeking, zoom, and preview looping.
+- Direct image and GIF URL imports for NextBot sprites and custom killfeed icons, with previews and automatic addon conversion.
+- Verified portable yt-dlp and Deno downloads in release packaging, bundled FFprobe, and an explicit downloader update action.
+
+### Changed
+
+- Sound entries now retain source paths, optional source URLs, and trim points while loading older projects automatically.
+- Asset import validates canonical destination boundaries while preserving relocatable paths.
+- App-only packaging accepts `-SkipTools` as an alias for `-SkipFfmpeg`.
+
 ## [0.6.0] - 2026-09-04
 
 ### Added

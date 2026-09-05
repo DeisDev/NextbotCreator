@@ -150,6 +150,7 @@ pub fn save_project(project: &Project) -> Result<(), PersistenceError> {
         source,
     })?;
     let mut portable = project.clone();
+    portable.format_version = 2;
     portable.root = PathBuf::from(".");
     visit_asset_paths_mut(&mut portable, |path| {
         if let Ok(relative) = path.strip_prefix(&project.root) {
@@ -204,15 +205,53 @@ pub fn import_source_asset(
     bot_class: &str,
     source: &Path,
 ) -> Result<PathBuf, PersistenceError> {
+    let invalid_path = || PersistenceError::Io {
+        path: project.root.clone(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "asset destination must remain inside the project",
+        ),
+    };
+    if bot_class != crate::domain::sanitize_class_name(bot_class) {
+        return Err(invalid_path());
+    }
+    let root = project
+        .root
+        .canonicalize()
+        .map_err(|source| PersistenceError::Io {
+            path: project.root.clone(),
+            source,
+        })?;
     let file_name = source.file_name().ok_or_else(|| PersistenceError::Io {
         path: source.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "source has no filename"),
     })?;
-    let destination_dir = project.root.join("source_assets").join(bot_class);
+    let assets = root.join("source_assets");
+    if assets.exists()
+        && !assets
+            .canonicalize()
+            .map_err(|_| invalid_path())?
+            .starts_with(&root)
+    {
+        return Err(invalid_path());
+    }
+    let destination_dir = assets.join(bot_class);
+    if destination_dir.exists()
+        && !destination_dir
+            .canonicalize()
+            .map_err(|_| invalid_path())?
+            .starts_with(&root)
+    {
+        return Err(invalid_path());
+    }
     fs::create_dir_all(&destination_dir).map_err(|source| PersistenceError::Io {
         path: destination_dir.clone(),
         source,
     })?;
+    let destination_dir = destination_dir.canonicalize().map_err(|_| invalid_path())?;
+    if !destination_dir.starts_with(&root) {
+        return Err(invalid_path());
+    }
     let destination = unique_destination(&destination_dir, file_name);
     fs::copy(source, &destination).map_err(|source| PersistenceError::Io {
         path: destination.clone(),
@@ -237,7 +276,13 @@ pub fn import_source_asset(
             })?;
         }
     }
-    Ok(destination)
+    // Return the project's spelling of the path so save_project can make it relative
+    // even when Windows canonicalization adds a verbatim (\\?\) prefix.
+    Ok(project
+        .root
+        .join("source_assets")
+        .join(bot_class)
+        .join(destination.file_name().unwrap()))
 }
 
 fn unique_destination(directory: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
@@ -285,8 +330,8 @@ fn visit_asset_paths_mut(project: &mut Project, mut visit: impl FnMut(&mut PathB
             visit(source);
         }
         for slot in crate::domain::AudioSlot::ALL {
-            for path in slot.get_mut(&mut bot.audio) {
-                visit(path);
+            for clip in slot.get_mut(&mut bot.audio) {
+                visit(&mut clip.source);
             }
         }
     }
@@ -315,7 +360,7 @@ mod tests {
         project.nextbots[0].visual.killfeed_icon.source = Some(source.clone());
         for slot in crate::domain::AudioSlot::ALL {
             slot.get_mut(&mut project.nextbots[0].audio)
-                .push(source.clone());
+                .push(source.clone().into());
         }
         save_project(&project).unwrap();
         let persisted = fs::read_to_string(project.root.join(PROJECT_FILE)).unwrap();
@@ -329,7 +374,10 @@ mod tests {
             Some(&source)
         );
         for slot in crate::domain::AudioSlot::ALL {
-            assert_eq!(slot.get(&loaded.nextbots[0].audio), &vec![source.clone()]);
+            assert_eq!(
+                slot.get(&loaded.nextbots[0].audio),
+                &vec![source.clone().into()]
+            );
         }
         fs::remove_dir_all(root).unwrap();
     }

@@ -79,6 +79,13 @@ pub fn validate_project(project: &Project) -> Result<Vec<String>, GenerationErro
         if bot.category.trim().is_empty() {
             errors.push(format!("{} has no spawnmenu category.", bot.display_name));
         }
+        for slot in AudioSlot::ALL {
+            for clip in slot.get(&bot.audio) {
+                if let Err(error) = clip.trim.validate() {
+                    errors.push(format!("{} / {}: {error}", bot.display_name, slot.label()));
+                }
+            }
+        }
         if bot.visual.material_name.trim().is_empty()
             || bot.visual.material_name != slugify(&bot.visual.material_name)
         {
@@ -439,7 +446,7 @@ fn convert_bot_audio(
                 .join(&bot.class_name)
                 .join(format!("{key}_{:02}.wav", index + 1));
             let destination = project.root.join(&relative);
-            converter::convert_audio(source, &destination, portable_root)?;
+            converter::convert_audio_clip(source, &destination, portable_root)?;
             generated.insert(relative.clone());
             *written += 1;
             waves.push(
@@ -1111,7 +1118,7 @@ mod tests {
         let root = std::env::temp_dir().join("nbc_generator_media_test");
         let project = Project::new("Example", root);
         let mut bot = project.nextbots[0].clone();
-        bot.audio.jump.push(PathBuf::from("jump.mp3"));
+        bot.audio.jump.push(PathBuf::from("jump.mp3").into());
         let sounds = SoundNames {
             slots: BTreeMap::from([(AudioSlot::Jump, "nbc.example.npc_my_nextbot.jump".into())]),
             ..SoundNames::default()
@@ -1185,7 +1192,8 @@ mod tests {
         let mut project = Project::new("Sounds", PathBuf::from("sounds"));
         let bot = &mut project.nextbots[0];
         for slot in AudioSlot::ALL {
-            slot.get_mut(&mut bot.audio).push(PathBuf::from("clip.wav"));
+            slot.get_mut(&mut bot.audio)
+                .push(PathBuf::from("clip.wav").into());
         }
         bot.hook_recipes.push(HookRecipe {
             event: HookEvent::ServerInitialize,
@@ -1250,7 +1258,7 @@ mod tests {
         fs::write(&source, wav).unwrap();
         for slot in AudioSlot::ALL {
             slot.get_mut(&mut project.nextbots[0].audio)
-                .extend([source.clone(), source.clone()]);
+                .extend([source.clone().into(), source.clone().into()]);
         }
         crate::persistence::save_project(&project).unwrap();
         let mut project = crate::persistence::load_project(&root).unwrap();
