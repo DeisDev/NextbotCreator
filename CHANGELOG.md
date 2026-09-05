@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [NextbotCreator]
 
+## [0.6.0] - 2026-09-04
+
+### Added
+
+- GitHub repository and issue tracker links in the toolbar.
+- Background update checks against published GitHub releases, a portable startup-check preference, manual checks, and dismissible new-version notices.
+- Compressed portable release ZIPs with SHA-256 checksums, and distinct app-only archives for updating without downloading FFmpeg again.
+
+### Fixed
+
+- Release packaging cleanup now checks directory boundaries before replacing build folders.
+
 ## [0.5.1] - 2026-09-04
 
 ### Changed

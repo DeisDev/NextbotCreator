@@ -33,6 +33,12 @@ pub struct AppSettings {
     pub garrys_mod_root: Option<PathBuf>,
     #[serde(default)]
     pub recent_projects: Vec<PathBuf>,
+    #[serde(default = "default_check_for_updates")]
+    pub check_for_updates_on_startup: bool,
+}
+
+fn default_check_for_updates() -> bool {
+    true
 }
 
 impl AppSettings {
@@ -45,6 +51,7 @@ impl AppSettings {
                 projects_root: portable_root.join("projects"),
                 garrys_mod_root: None,
                 recent_projects: Vec::new(),
+                check_for_updates_on_startup: true,
             });
         if settings.projects_root.is_relative() {
             settings.projects_root = portable_root.join(&settings.projects_root);
@@ -338,6 +345,7 @@ mod tests {
             projects_root: root.join("projects"),
             garrys_mod_root: Some(PathBuf::from(r"C:\Games\GarrysMod\garrysmod")),
             recent_projects: vec![root.join("projects").join("recent")],
+            check_for_updates_on_startup: false,
         };
         settings.save(&root).unwrap();
         let persisted = fs::read_to_string(root.join("settings.json")).unwrap();
@@ -346,7 +354,20 @@ mod tests {
         assert_eq!(loaded.projects_root, root.join("projects"));
         assert_eq!(loaded.garrys_mod_root, settings.garrys_mod_root);
         assert_eq!(loaded.recent_projects, settings.recent_projects);
+        assert!(!loaded.check_for_updates_on_startup);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn older_settings_enable_startup_update_checks_without_losing_paths() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"projects_root":"projects","garrys_mod_root":null,"recent_projects":["projects/existing"]}"#,
+        ).unwrap();
+        assert!(settings.check_for_updates_on_startup);
+        assert_eq!(
+            settings.recent_projects,
+            vec![PathBuf::from("projects/existing")]
+        );
     }
 
     #[test]
@@ -362,6 +383,7 @@ mod tests {
             projects_root: root.clone(),
             garrys_mod_root: None,
             recent_projects: Vec::new(),
+            check_for_updates_on_startup: true,
         };
         settings.remember_project(&first.root);
         settings.remember_project(&second.root);

@@ -16,6 +16,7 @@ use nextbot_creator::domain::{
 use nextbot_creator::generator;
 use nextbot_creator::integration::{self, LinkStatus};
 use nextbot_creator::persistence::{self, AppSettings};
+use nextbot_creator::updates::{self, UpdateChecker, UpdateOutcome, UpdateStatus};
 use nextbot_creator::{APP_NAME, APP_VERSION, PROJECT_FILE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,6 +88,9 @@ pub struct CreatorApp {
     ffmpeg_available: bool,
     link_cache: Option<(Instant, LinkStatus)>,
     status_details: bool,
+    updates: UpdateChecker,
+    show_updates: bool,
+    update_notice_dismissed: bool,
 }
 
 impl CreatorApp {
@@ -105,6 +109,10 @@ impl CreatorApp {
         }
         let recent_projects = settings.available_projects();
         let ffmpeg_available = converter::ffmpeg_path(&portable_root).is_some();
+        let mut updates = UpdateChecker::default();
+        if settings.check_for_updates_on_startup {
+            updates.start();
+        }
         Self {
             portable_root,
             settings,
@@ -130,6 +138,9 @@ impl CreatorApp {
             ffmpeg_available,
             link_cache: None,
             status_details: false,
+            updates,
+            show_updates: false,
+            update_notice_dismissed: false,
         }
     }
 
@@ -499,6 +510,13 @@ impl CreatorApp {
                     ui.label(RichText::new(format!("v{APP_VERSION}")).small().weak());
                     let busy = self.generation.is_some();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Updates").clicked() {
+                            self.show_updates = true;
+                        }
+                        ui.hyperlink_to("↗ Issues", updates::ISSUES_URL)
+                            .on_hover_text("Report a bug or request a feature on GitHub");
+                        ui.hyperlink_to("↗ GitHub", updates::REPOSITORY_URL)
+                            .on_hover_text("Open the NextbotCreator repository");
                         if self.project.is_some() {
                             if ui
                                 .add_enabled(!busy, primary_button("Generate addon"))
@@ -605,6 +623,79 @@ impl CreatorApp {
         };
         self.link_cache = Some((Instant::now(), status.clone()));
         status
+    }
+
+    fn update_notice(&mut self, root: &mut egui::Ui) {
+        if self.update_notice_dismissed {
+            return;
+        }
+        if let UpdateStatus::Finished(Ok(UpdateOutcome::Available { version, url })) =
+            self.updates.status()
+        {
+            egui::Panel::top("update_notice")
+                .frame(panel_frame())
+                .show_inside(root, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            accent(),
+                            format!("NextbotCreator {version} is available"),
+                        );
+                        ui.hyperlink_to("View release ↗", url);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Dismiss").clicked() {
+                                self.update_notice_dismissed = true;
+                            }
+                        });
+                    });
+                });
+        }
+    }
+
+    fn updates_window(&mut self, context: &egui::Context) {
+        let mut open = self.show_updates;
+        egui::Window::new("Updates")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(420.0)
+            .show(context, |ui| {
+                ui.label(format!("Installed version: {APP_VERSION}"));
+                let previous = self.settings.check_for_updates_on_startup;
+                if ui.checkbox(&mut self.settings.check_for_updates_on_startup, "Check for updates at startup").changed() {
+                    match self.settings.save(&self.portable_root) {
+                        Ok(()) => {
+                            if self.settings.check_for_updates_on_startup {
+                                self.updates.start();
+                            }
+                        }
+                        Err(error) => {
+                            self.settings.check_for_updates_on_startup = previous;
+                            self.set_error(error);
+                        }
+                    }
+                }
+                ui.label(RichText::new("Checks public GitHub releases. Updates are downloaded manually.").small().weak());
+                ui.separator();
+                match self.updates.status() {
+                    UpdateStatus::NotChecked => { ui.label("No update check yet."); }
+                    UpdateStatus::Checking => {
+                        ui.horizontal(|ui| { ui.spinner(); ui.label("Checking GitHub..."); });
+                    }
+                    UpdateStatus::Finished(Ok(UpdateOutcome::UpToDate)) => { ui.label("You're up to date."); }
+                    UpdateStatus::Finished(Ok(UpdateOutcome::NoRelease)) => { ui.label("No public stable release is available yet, or the repository is unavailable."); }
+                    UpdateStatus::Finished(Ok(UpdateOutcome::Available { version, url })) => {
+                        ui.colored_label(accent(), format!("Version {version} is available."));
+                        ui.hyperlink_to("View release and download ↗", url);
+                    }
+                    UpdateStatus::Finished(Err(error)) => { ui.colored_label(error_color(), error.to_string()); }
+                }
+                if ui.add_enabled(self.updates.can_check(), egui::Button::new("Check for updates"))
+                    .on_disabled_hover_text("Checks are limited to once per minute. Please wait before trying again.")
+                    .clicked() {
+                    self.updates.start();
+                }
+                ui.hyperlink_to("All releases ↗", updates::RELEASES_URL);
+            });
+        self.show_updates = open;
     }
 
     fn status_bar(&mut self, root: &mut egui::Ui) {
@@ -1741,6 +1832,12 @@ impl eframe::App for CreatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         self.poll_generation(&context);
+        if self.updates.poll() {
+            self.update_notice_dismissed = false;
+        }
+        if matches!(self.updates.status(), UpdateStatus::Checking) || self.show_updates {
+            context.request_repaint_after(Duration::from_millis(250));
+        }
         if context.input(|input| input.viewport().close_requested())
             && !self.allow_close
             && (self.is_dirty() || self.generation.is_some())
@@ -1763,6 +1860,7 @@ impl eframe::App for CreatorApp {
             }
         }
         self.top_bar(ui);
+        self.update_notice(ui);
         self.status_bar(ui);
         if self.project.is_none() {
             self.home(ui);
@@ -1770,6 +1868,7 @@ impl eframe::App for CreatorApp {
             self.project_ui(ui);
         }
         self.leave_dialog(&context);
+        self.updates_window(&context);
     }
 }
 
@@ -2106,6 +2205,7 @@ mod tests {
                 projects_root: root,
                 garrys_mod_root: None,
                 recent_projects: Vec::new(),
+                check_for_updates_on_startup: false,
             },
             saved_project: Some(project.clone()),
             project: Some(project),
@@ -2129,6 +2229,9 @@ mod tests {
             ffmpeg_available: false,
             link_cache: None,
             status_details: false,
+            updates: UpdateChecker::default(),
+            show_updates: false,
+            update_notice_dismissed: false,
         }
     }
 

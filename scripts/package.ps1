@@ -9,6 +9,7 @@ $version = ((cargo metadata --manifest-path $manifest --no-deps --format-version
 if (-not $version) { throw 'Could not read the package version from Cargo.toml' }
 $distRoot = Join-Path $workspace 'dist'
 $bundle = Join-Path $distRoot "NextbotCreator-$version-windows-x64"
+if ($SkipFfmpeg) { $bundle += '-app-only' }
 $cache = Join-Path $workspace 'vendor\tools\cache'
 $ffmpegArchive = Join-Path $cache 'ffmpeg-8.1.2-essentials_build.zip'
 $ffmpegUrl = 'https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip'
@@ -23,7 +24,7 @@ try {
     if (Test-Path $bundle) {
         $resolvedBundle = (Resolve-Path $bundle).Path
         $resolvedDist = (Resolve-Path $distRoot).Path
-        if (-not $resolvedBundle.StartsWith($resolvedDist, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $resolvedBundle.StartsWith($resolvedDist + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
             throw "Refusing to replace a folder outside dist: $resolvedBundle"
         }
         Remove-Item -LiteralPath $resolvedBundle -Recurse -Force
@@ -62,7 +63,7 @@ try {
         if (Test-Path $extract) {
             $resolvedExtract = (Resolve-Path $extract).Path
             $resolvedTemp = (Resolve-Path $env:TEMP).Path
-            if (-not $resolvedExtract.StartsWith($resolvedTemp, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if (-not $resolvedExtract.StartsWith($resolvedTemp + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw "Refusing to clear a folder outside the temporary directory: $resolvedExtract"
             }
             Remove-Item -LiteralPath $resolvedExtract -Recurse -Force
@@ -82,7 +83,24 @@ try {
         Remove-Item -LiteralPath $extract -Recurse -Force
     }
 
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = "$bundle.zip"
+    $zipStaging = "$zip.partial"
+    try {
+        if (Test-Path -LiteralPath $zipStaging) { Remove-Item -LiteralPath $zipStaging -Force }
+        [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            $bundle, $zipStaging, [System.IO.Compression.CompressionLevel]::Optimal, $true
+        )
+        Move-Item -LiteralPath $zipStaging -Destination $zip -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $zipStaging) { Remove-Item -LiteralPath $zipStaging -Force }
+    }
+    $zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+    "$zipHash  $([System.IO.Path]::GetFileName($zip))" | Set-Content -LiteralPath "$zip.sha256" -Encoding ASCII
+    $zipMiB = [Math]::Round((Get-Item -LiteralPath $zip).Length / 1MB, 2)
     Write-Host "Portable bundle created at $bundle"
+    Write-Host "Release archive created at $zip ($zipMiB MiB), with SHA-256 checksum"
 }
 finally {
     Pop-Location
