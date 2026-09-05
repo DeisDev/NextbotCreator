@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [NextbotCreator]
 
+## [Unreleased]
+
+### Added
+
+- Dedicated application Settings screen with a gear icon and a back button that preserves the active project and editor.
+
+### Changed
+
+- Moved update preferences, update checks, media downloader updates, and Garry's Mod folder controls into Settings.
+- Moved repository and issue tracker links into Settings to keep the toolbar readable at smaller window sizes.
+- Made the Project menu easier to recognize with a dropdown arrow and visible border.
+
 ## [0.7.0] - 2026-09-05
 
 ### Added

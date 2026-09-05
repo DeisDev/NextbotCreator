@@ -17,8 +17,10 @@ use nextbot_creator::domain::{
 use nextbot_creator::generator;
 use nextbot_creator::integration::{self, LinkStatus};
 use nextbot_creator::persistence::{self, AppSettings};
-use nextbot_creator::updates::{self, UpdateChecker, UpdateOutcome, UpdateStatus};
+use nextbot_creator::updates::{UpdateChecker, UpdateOutcome, UpdateStatus};
 use nextbot_creator::{APP_NAME, APP_VERSION, PROJECT_FILE};
+
+mod settings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum EditorPage {
@@ -90,7 +92,7 @@ pub struct CreatorApp {
     link_cache: Option<(Instant, LinkStatus)>,
     status_details: bool,
     updates: UpdateChecker,
-    show_updates: bool,
+    show_settings: bool,
     update_notice_dismissed: bool,
     media_dialog: Option<MediaDialog>,
     downloader_update: Option<nextbot_creator::media::MediaJob<String>>,
@@ -142,7 +144,7 @@ impl CreatorApp {
             link_cache: None,
             status_details: false,
             updates,
-            show_updates: false,
+            show_settings: false,
             update_notice_dismissed: false,
             media_dialog: None,
             downloader_update: None,
@@ -255,6 +257,7 @@ impl CreatorApp {
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             LeaveAction::Home => {
+                self.show_settings = false;
                 self.project = None;
                 self.saved_project = None;
                 self.preview = None;
@@ -634,13 +637,13 @@ impl CreatorApp {
                     ui.label(RichText::new(format!("v{APP_VERSION}")).small().weak());
                     let busy = self.generation.is_some();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Updates").clicked() {
-                            self.show_updates = true;
+                        if ui
+                            .add(egui::Button::new("⚙ Settings").selected(self.show_settings))
+                            .on_hover_text("Application settings, updates, and tools")
+                            .clicked()
+                        {
+                            self.show_settings = !self.show_settings;
                         }
-                        ui.hyperlink_to("↗ Issues", updates::ISSUES_URL)
-                            .on_hover_text("Report a bug or request a feature on GitHub");
-                        ui.hyperlink_to("↗ GitHub", updates::REPOSITORY_URL)
-                            .on_hover_text("Open the NextbotCreator repository");
                         if self.project.is_some() {
                             if ui
                                 .add_enabled(!busy, primary_button("Generate addon"))
@@ -669,7 +672,12 @@ impl CreatorApp {
                         }
                         if self.project.is_some() {
                             ui.add_enabled_ui(!busy, |ui| {
-                                ui.menu_button("Project", |ui| {
+                                egui::containers::menu::MenuButton::from_button(
+                                    egui::Button::new("Project")
+                                        .right_text("⏷")
+                                        .stroke(egui::Stroke::new(1.0, Color32::from_gray(85))),
+                                )
+                                .ui(ui, |ui| {
                                     if ui.button("Open project folder").clicked() {
                                         if let Some(project) = &self.project {
                                             open_in_explorer(&project.root);
@@ -705,6 +713,7 @@ impl CreatorApp {
                                     }
                                     ui.separator();
                                     if ui.button("Project settings").clicked() {
+                                        self.show_settings = false;
                                         self.page = EditorPage::Project;
                                         ui.close();
                                     }
@@ -712,7 +721,9 @@ impl CreatorApp {
                                         self.request_leave(LeaveAction::Home, ui.ctx());
                                         ui.close();
                                     }
-                                });
+                                })
+                                .0
+                                .on_hover_text("Project actions and settings");
                             });
                             ui.label(
                                 RichText::new(if self.is_dirty() {
@@ -773,64 +784,6 @@ impl CreatorApp {
                     });
                 });
         }
-    }
-
-    fn updates_window(&mut self, context: &egui::Context) {
-        let mut open = self.show_updates;
-        egui::Window::new("Updates")
-            .open(&mut open)
-            .resizable(false)
-            .default_width(420.0)
-            .show(context, |ui| {
-                ui.label(format!("Installed version: {APP_VERSION}"));
-                ui.separator();
-                ui.label("Media download tools");
-                ui.label(RichText::new("Update the downloader if YouTube or TikTok imports stop working.").small().weak());
-                if let Some(job) = &self.downloader_update {
-                    ui.horizontal(|ui| { ui.spinner(); ui.label(job.context.progress()); });
-                    if ui.button("Cancel downloader update").clicked() { job.context.cancel(); }
-                } else if ui.add_enabled(self.media_dialog.is_none(), egui::Button::new("Update downloader")).clicked() {
-                    let root = self.portable_root.clone();
-                    self.downloader_update = Some(nextbot_creator::media::MediaJob::start(move |context| nextbot_creator::media_tools::update_downloader(&root, &context)));
-                }
-                ui.separator();
-                let previous = self.settings.check_for_updates_on_startup;
-                if ui.checkbox(&mut self.settings.check_for_updates_on_startup, "Check for updates at startup").changed() {
-                    match self.settings.save(&self.portable_root) {
-                        Ok(()) => {
-                            if self.settings.check_for_updates_on_startup {
-                                self.updates.start();
-                            }
-                        }
-                        Err(error) => {
-                            self.settings.check_for_updates_on_startup = previous;
-                            self.set_error(error);
-                        }
-                    }
-                }
-                ui.label(RichText::new("Checks public GitHub releases. Updates are downloaded manually.").small().weak());
-                ui.separator();
-                match self.updates.status() {
-                    UpdateStatus::NotChecked => { ui.label("No update check yet."); }
-                    UpdateStatus::Checking => {
-                        ui.horizontal(|ui| { ui.spinner(); ui.label("Checking GitHub..."); });
-                    }
-                    UpdateStatus::Finished(Ok(UpdateOutcome::UpToDate)) => { ui.label("You're up to date."); }
-                    UpdateStatus::Finished(Ok(UpdateOutcome::NoRelease)) => { ui.label("No public stable release is available yet, or the repository is unavailable."); }
-                    UpdateStatus::Finished(Ok(UpdateOutcome::Available { version, url })) => {
-                        ui.colored_label(accent(), format!("Version {version} is available."));
-                        ui.hyperlink_to("View release and download ↗", url);
-                    }
-                    UpdateStatus::Finished(Err(error)) => { ui.colored_label(error_color(), error.to_string()); }
-                }
-                if ui.add_enabled(self.updates.can_check(), egui::Button::new("Check for updates"))
-                    .on_disabled_hover_text("Checks are limited to once per minute. Please wait before trying again.")
-                    .clicked() {
-                    self.updates.start();
-                }
-                ui.hyperlink_to("All releases ↗", updates::RELEASES_URL);
-            });
-        self.show_updates = open;
     }
 
     fn status_bar(&mut self, root: &mut egui::Ui) {
@@ -965,40 +918,9 @@ impl CreatorApp {
                         } else {
                             ui.label("Not detected");
                         }
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("Choose folder…").clicked()
-                                && let Some(path) = rfd::FileDialog::new().pick_folder()
-                            {
-                                match integration::normalize_gmod_root(&path) {
-                                    Some(path) => {
-                                        self.settings.garrys_mod_root = Some(path);
-                                        self.link_cache = None;
-                                        if let Err(error) = self.settings.save(&self.portable_root)
-                                        {
-                                            self.set_error(error);
-                                        } else {
-                                            self.set_status("Garry's Mod path saved.");
-                                        }
-                                    }
-                                    None => self.set_error(
-                                        "That folder does not contain garrysmod/addons.",
-                                    ),
-                                }
-                            }
-                            if ui.button("Detect again").clicked() {
-                                self.detected_gmod = integration::detect_garrys_mod();
-                                if let Some(path) = self.detected_gmod.first().cloned() {
-                                    self.settings.garrys_mod_root = Some(path);
-                                    self.link_cache = None;
-                                    let _ = self.settings.save(&self.portable_root);
-                                    self.set_status("Garry's Mod detected.");
-                                } else {
-                                    self.set_error(
-                                        "No Garry's Mod installation was found in Steam libraries.",
-                                    );
-                                }
-                            }
-                        });
+                        if ui.button("⚙ Open settings").clicked() {
+                            self.show_settings = true;
+                        }
                     });
                 });
             });
@@ -1973,21 +1895,8 @@ impl CreatorApp {
         } else {
             ui.colored_label(Color32::YELLOW, "No valid Garry's Mod folder selected.");
         }
-        if ui.button("Choose Garry's Mod folder…").clicked()
-            && let Some(path) = rfd::FileDialog::new().pick_folder()
-        {
-            match integration::normalize_gmod_root(&path) {
-                Some(path) => {
-                    self.settings.garrys_mod_root = Some(path);
-                    self.link_cache = None;
-                    if let Err(error) = self.settings.save(&self.portable_root) {
-                        self.set_error(error);
-                    } else {
-                        self.set_status("Garry's Mod path saved.");
-                    }
-                }
-                None => self.set_error("That folder does not contain garrysmod/addons."),
-            }
+        if ui.button("⚙ Open application settings").clicked() {
+            self.show_settings = true;
         }
     }
 }
@@ -2013,7 +1922,7 @@ impl eframe::App for CreatorApp {
         if self.updates.poll() {
             self.update_notice_dismissed = false;
         }
-        if matches!(self.updates.status(), UpdateStatus::Checking) || self.show_updates {
+        if matches!(self.updates.status(), UpdateStatus::Checking) || self.show_settings {
             context.request_repaint_after(Duration::from_millis(250));
         }
         if context.input(|input| input.viewport().close_requested())
@@ -2036,6 +1945,7 @@ impl eframe::App for CreatorApp {
             if self.project.is_some()
                 && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F))
             {
+                self.show_settings = false;
                 self.page = EditorPage::Advanced;
                 context.memory_mut(|memory| memory.request_focus(egui::Id::new("advanced_search")));
             }
@@ -2043,13 +1953,14 @@ impl eframe::App for CreatorApp {
         self.top_bar(ui);
         self.update_notice(ui);
         self.status_bar(ui);
-        if self.project.is_none() {
+        if self.show_settings {
+            self.settings_ui(ui);
+        } else if self.project.is_none() {
             self.home(ui);
         } else {
             self.project_ui(ui);
         }
         self.leave_dialog(&context);
-        self.updates_window(&context);
         self.show_media(&context);
     }
 }
@@ -2412,7 +2323,7 @@ mod tests {
             link_cache: None,
             status_details: false,
             updates: UpdateChecker::default(),
-            show_updates: false,
+            show_settings: false,
             update_notice_dismissed: false,
             media_dialog: None,
             downloader_update: None,
