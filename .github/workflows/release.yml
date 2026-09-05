@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  release:
+    if: ${{ !github.event.deleted }}
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+      # Embed the MSVC runtime so the portable app needs no redistributable installer.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Windows x64 Rust
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt,clippy
+
+      - name: Validate the version and prepare release notes
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read Cargo.toml' }
+          $version = (($metadata | ConvertFrom-Json).packages | Where-Object name -eq 'nextbot-creator').version
+          if ($version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'Only stable major.minor.patch versions can be released'
+          }
+          if ($env:GITHUB_REF_NAME -cne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version v$version"
+          }
+          $changelog = Get-Content -LiteralPath CHANGELOG.md -Raw
+          $section = [regex]::Match($changelog, "(?ms)^## \[$([regex]::Escape($version))\] - \d{4}-\d{2}-\d{2}\r?\n(.*?)(?=^## |\z)")
+          if (-not $section.Success -or -not $section.Groups[1].Value.Trim()) {
+            throw "Add a dated, nonempty [$version] section to CHANGELOG.md before releasing"
+          }
+          $section.Groups[1].Value.Trim() | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'release-notes.md') -Encoding utf8
+          "RELEASE_VERSION=$version" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "RELEASE_ZIP=dist/NextbotCreator-$version-windows-x64.zip" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Build the portable ZIP with all bundled tools
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\package.ps1
+
+      - name: Verify the ZIP and smoke test bundled tools
+        run: |
+          $bundleName = "NextbotCreator-$env:RELEASE_VERSION-windows-x64"
+          $hash = (Get-FileHash -LiteralPath $env:RELEASE_ZIP -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksum = (Get-Content -LiteralPath "$env:RELEASE_ZIP.sha256" -Raw).Trim()
+          if ($checksum -cne "$hash  $bundleName.zip") { throw 'Release ZIP checksum mismatch' }
+          $required = @(
+            'NextbotCreator.exe', 'README.md', 'CHANGELOG.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt',
+            'tools/ffmpeg.exe', 'tools/ffprobe.exe', 'tools/ffmpeg-build-info.txt', 'tools/ffmpeg-license.txt',
+            'tools/yt-dlp.exe', 'tools/yt-dlp-version.txt', 'tools/yt-dlp-license.txt', 'tools/yt-dlp-third-party-licenses.txt',
+            'tools/deno.exe', 'tools/deno-license.txt', 'tools/deno-third-party-licenses.txt'
+          ) | ForEach-Object { "$bundleName/$_" }
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $env:RELEASE_ZIP).Path)
+          try {
+            $files = @($archive.Entries | Where-Object { $_.Name })
+            $names = @($files | ForEach-Object { $_.FullName.Replace('\', '/') })
+            if ($files.Count -ne $required.Count -or (Compare-Object $required $names)) {
+              throw 'Release ZIP must contain only the app, bundled tools, README, changelog, and legal notices'
+            }
+            if ($files | Where-Object Length -eq 0) { throw 'Release ZIP contains an empty file' }
+          }
+          finally { $archive.Dispose() }
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'portable-release-smoke'
+          Expand-Archive -LiteralPath $env:RELEASE_ZIP -DestinationPath $smokeRoot
+          $env:NEXTBOTCREATOR_SMOKE_ROOT = Join-Path $smokeRoot $bundleName
+          foreach ($tool in @('ffmpeg', 'ffprobe', 'yt-dlp', 'deno')) {
+            $versionFlag = if ($tool -in @('ffmpeg', 'ffprobe')) { '-version' } else { '--version' }
+            & (Join-Path $env:NEXTBOTCREATOR_SMOKE_ROOT "tools/$tool.exe") $versionFlag
+            if ($LASTEXITCODE -ne 0) { throw "Bundled $tool could not run" }
+          }
+          cargo test --locked --test media_workflow audio_conversion_trimming_and_waveform_smoke -- --ignored --exact
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged audio conversion smoke test failed' }
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          "`nDownload $bundleName.zip, extract it, and run NextbotCreator.exe. FFmpeg, FFprobe, yt-dlp, Deno, and their license notices are included." | Add-Content -LiteralPath $notesPath
+          "`nSHA-256 ($bundleName.zip):`n`n$hash" | Add-Content -LiteralPath $notesPath
+
+      - name: Publish the release with one portable ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME $env:RELEASE_ZIP --verify-tag --title "NextbotCreator $env:RELEASE_VERSION" --notes-file (Join-Path $env:RUNNER_TEMP 'release-notes.md')
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed' }

@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Dedicated application Settings screen with a gear icon and a back button that preserves the active project and editor.
+- Release-only GitHub Actions workflow for stable version tags, publishing one portable Windows x64 ZIP with all bundled tools, an embedded Visual C++ runtime, and a checksum in the release notes after version, code, and package smoke checks.
 
 ### Changed
 
