@@ -15,6 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Refined the dark desktop layout with labeled vector icons, a dedicated project toolbar, clearer editor navigation, and consistent form controls.
+- Organized application Settings into General, Media tools, Updates, and About, with connection and tool status, direct folder access, and contextual error details.
+- Improved project cards, empty states, search fields, and compact-window spacing; made the missing-audio-tool status open Media tools directly.
 - Moved update preferences, update checks, media downloader updates, and Garry's Mod folder controls into Settings.
 - Moved repository and issue tracker links into Settings to keep the toolbar readable at smaller window sizes.
 - Made the Project menu easier to recognize with a dropdown arrow and visible border.
