@@ -277,16 +277,8 @@ fn visit_asset_paths_mut(project: &mut Project, mut visit: impl FnMut(&mut PathB
         if let Some(source) = &mut bot.visual.killfeed_icon.source {
             visit(source);
         }
-        for paths in [
-            &mut bot.audio.spawn,
-            &mut bot.audio.idle,
-            &mut bot.audio.damage,
-            &mut bot.audio.death,
-            &mut bot.audio.downed,
-            &mut bot.audio.jump,
-            &mut bot.audio.footsteps,
-        ] {
-            for path in paths {
+        for slot in crate::domain::AudioSlot::ALL {
+            for path in slot.get_mut(&mut bot.audio) {
                 visit(path);
             }
         }
@@ -314,8 +306,10 @@ mod tests {
         let mut project = project;
         project.nextbots[0].visual.source = Some(source.clone());
         project.nextbots[0].visual.killfeed_icon.source = Some(source.clone());
-        project.nextbots[0].audio.spawn.push(source.clone());
-        project.nextbots[0].audio.jump.push(source.clone());
+        for slot in crate::domain::AudioSlot::ALL {
+            slot.get_mut(&mut project.nextbots[0].audio)
+                .push(source.clone());
+        }
         save_project(&project).unwrap();
         let persisted = fs::read_to_string(project.root.join(PROJECT_FILE)).unwrap();
         assert!(!persisted.contains(&project.root.display().to_string()));
@@ -327,8 +321,9 @@ mod tests {
             loaded.nextbots[0].visual.killfeed_icon.source.as_ref(),
             Some(&source)
         );
-        assert_eq!(loaded.nextbots[0].audio.spawn, vec![source]);
-        assert_eq!(loaded.nextbots[0].audio.jump.len(), 1);
+        for slot in crate::domain::AudioSlot::ALL {
+            assert_eq!(slot.get(&loaded.nextbots[0].audio), &vec![source.clone()]);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

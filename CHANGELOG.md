@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [NextbotCreator]
 
+## [0.5.1] - 2026-09-04
+
+### Changed
+
+- Replaced the home-screen slogans with a compact Projects header, available-project count, and an Open project action.
+
+## [0.5.0] - 2026-09-04
+
+### Added
+
+- Enemy spotted, chase, enemy lost, melee attack, ranged attack, and landing sound slots with portable asset paths and automatic conversion.
+- NextBot and sound search, save/generate/search shortcuts, unsaved-change protection, and undo for NextBot removal.
+- An enabled-by-default option to ignore other NextBots and prevent damage between them, including projects saved by earlier versions.
+
+### Changed
+
+- Refined the dark theme, sidebar navigation, editor spacing, project home, and status details.
+- Generate addons in the background with a progress indicator so the window stays responsive during conversion.
+- Increased Chase preset walking speed from 200 to 210 and running speed from 360 to 380; reapply the preset to update existing settings.
+
+### Fixed
+
+- Removed per-frame FFmpeg probes and repeated addon-link checks from the toolbar and status bar.
+- Adding or duplicating NextBots now always chooses a unique entity class name.
+- Advanced search opens matching sections and includes property descriptions and section names.
+
 ## [0.4.0] - 2026-09-03
 
 ### Added

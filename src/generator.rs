@@ -8,9 +8,9 @@ use thiserror::Error;
 use crate::catalog::{DRGBASE_BASELINE_COMMIT, property_catalog};
 use crate::converter::{self, ConversionError};
 use crate::domain::{
-    ATTACK_ACTIVITIES, BindTrigger, DAMAGE_TYPES, HookActionKind, HookEvent, KillfeedIconMode,
-    Nextbot, POSSESSION_KEYS, PossessionAction, Project, PropertyValue, SpawnTab, format_number,
-    lua_string, sanitize_class_name, slugify,
+    ATTACK_ACTIVITIES, AudioSlot, BindTrigger, DAMAGE_TYPES, HookActionKind, HookEvent,
+    KillfeedIconMode, Nextbot, POSSESSION_KEYS, PossessionAction, Project, PropertyValue, SpawnTab,
+    format_number, lua_string, sanitize_class_name, slugify,
 };
 use crate::{APP_VERSION, PROJECT_FILE};
 
@@ -412,13 +412,7 @@ pub fn generate_project(
 
 #[derive(Debug, Default)]
 struct SoundNames {
-    spawn: Option<String>,
-    idle: Option<String>,
-    damage: Option<String>,
-    death: Option<String>,
-    downed: Option<String>,
-    jump: Option<String>,
-    footsteps: Option<String>,
+    slots: BTreeMap<AudioSlot, String>,
     waves: BTreeMap<String, Vec<String>>,
 }
 
@@ -430,26 +424,20 @@ fn convert_bot_audio(
     written: &mut usize,
 ) -> Result<SoundNames, GenerationError> {
     let mut result = SoundNames::default();
-    for (slot, sources) in [
-        ("spawn", &bot.audio.spawn),
-        ("idle", &bot.audio.idle),
-        ("damage", &bot.audio.damage),
-        ("death", &bot.audio.death),
-        ("downed", &bot.audio.downed),
-        ("jump", &bot.audio.jump),
-        ("footsteps", &bot.audio.footsteps),
-    ] {
+    for slot in AudioSlot::ALL {
+        let sources = slot.get(&bot.audio);
+        let key = slot.key();
         if sources.is_empty() {
             continue;
         }
-        let logical = format!("nbc.{}.{}.{}", project.slug, bot.class_name, slot);
+        let logical = format!("nbc.{}.{}.{}", project.slug, bot.class_name, key);
         let mut waves = Vec::new();
         for (index, source) in sources.iter().enumerate() {
             let relative = PathBuf::from("sound")
                 .join("nextbotcreator")
                 .join(&project.slug)
                 .join(&bot.class_name)
-                .join(format!("{slot}_{:02}.wav", index + 1));
+                .join(format!("{key}_{:02}.wav", index + 1));
             let destination = project.root.join(&relative);
             converter::convert_audio(source, &destination, portable_root)?;
             generated.insert(relative.clone());
@@ -462,16 +450,7 @@ fn convert_bot_audio(
                     .replace('\\', "/"),
             );
         }
-        match slot {
-            "spawn" => result.spawn = Some(logical.clone()),
-            "idle" => result.idle = Some(logical.clone()),
-            "damage" => result.damage = Some(logical.clone()),
-            "death" => result.death = Some(logical.clone()),
-            "downed" => result.downed = Some(logical.clone()),
-            "jump" => result.jump = Some(logical.clone()),
-            "footsteps" => result.footsteps = Some(logical.clone()),
-            _ => {}
-        }
+        result.slots.insert(slot, logical.clone());
         result.waves.insert(logical, waves);
     }
     Ok(result)
@@ -541,35 +520,29 @@ fn render_shared(
         output.push('\n');
     }
 
+    for slot in AudioSlot::ALL {
+        let name = sounds.slots.get(&slot).cloned();
+        let value = if slot == AudioSlot::Footsteps {
+            name.as_ref()
+                .map(|name| format!("{{[MAT_DEFAULT] = {{{}}}}}", lua_string(name)))
+                .unwrap_or_else(|| "{}".into())
+        } else {
+            sound_list(&name)
+        };
+        output.push_str(&format!("ENT.{} = {}\n", slot.lua_field(), value));
+    }
     output.push_str(&format!(
-        "ENT.OnSpawnSounds = {}\n",
-        sound_list(&sounds.spawn)
+        "ENT.NBCIgnoreNextbots = {}\n",
+        bot.ignore_nextbots
     ));
-    output.push_str(&format!(
-        "ENT.OnIdleSounds = {}\n",
-        sound_list(&sounds.idle)
-    ));
-    output.push_str(&format!(
-        "ENT.OnDamageSounds = {}\n",
-        sound_list(&sounds.damage)
-    ));
-    output.push_str(&format!(
-        "ENT.OnDeathSounds = {}\n",
-        sound_list(&sounds.death)
-    ));
-    output.push_str(&format!(
-        "ENT.OnDownedSounds = {}\n",
-        sound_list(&sounds.downed)
-    ));
-    output.push_str(&format!("ENT.JumpSounds = {}\n", sound_list(&sounds.jump)));
-    output.push_str(&format!(
-        "ENT.Footsteps = {}\n\n",
-        sounds
-            .footsteps
-            .as_ref()
-            .map(|name| format!("{{[MAT_DEFAULT] = {{{}}}}}", lua_string(name)))
-            .unwrap_or_else(|| "{}".into())
-    ));
+    if let Some(name) = sounds.slots.get(&AudioSlot::Chase) {
+        let clips = sounds.waves.get(name).cloned().unwrap_or_default();
+        output.push_str(&format!(
+            "ENT.NBCChaseClips = {}\nENT.NBCSoundVolume = {}\nENT.NBCSoundPitch = {}\nENT.NBCSoundLevel = {}\n",
+            PropertyValue::StringList(clips).to_lua(),
+            bot.audio.volume.clamp(0.01, 1.0), bot.audio.pitch.clamp(1, 255), bot.audio.sound_level.clamp(20, 180)
+        ));
+    }
     if let Some(material) = killfeed_material {
         output.push_str(&format!(
             "if CLIENT then\n    ENT.Killicon = {{icon = {}, color = Color(255, 255, 255, 255)}}\nend\n\n",
@@ -577,10 +550,13 @@ fn render_shared(
         ));
     }
     output.push_str(&render_possession(bot));
-    if sounds.jump.is_some() {
+    if sounds.slots.contains_key(&AudioSlot::Jump) {
         output.push_str(
             "\nif SERVER then\n    function ENT:OnLeaveGround()\n        if #self.JumpSounds > 0 then\n            self:EmitSound(table.Random(self.JumpSounds))\n        end\n    end\nend\n",
         );
+    }
+    if sounds.slots.contains_key(&AudioSlot::Land) {
+        output.push_str("\nif SERVER then\n    function ENT:OnLandOnGround()\n        if #self.NBCLandSounds > 0 then\n            self:EmitSound(table.Random(self.NBCLandSounds))\n        end\n    end\nend\n");
     }
     output.push_str("\nDrGBase.AddNextbot(ENT)\n");
     output.push_str(&render_spawn_registration(bot));
@@ -667,6 +643,9 @@ fn render_server(bot: &Nextbot) -> String {
         "{}AddCSLuaFile(\"cl_init.lua\")\nAddCSLuaFile(\"shared.lua\")\ninclude(\"shared.lua\")\n\n",
         watermark()
     );
+    if bot.ignore_nextbots {
+        output.push_str("function ENT:ShouldIgnore(entity)\n    return IsValid(entity) and entity:IsNextBot()\nend\n\n");
+    }
     let uses_melee_helper = bot.combat.melee_enabled
         || bot
             .hook_recipes
@@ -681,19 +660,70 @@ fn render_server(bot: &Nextbot) -> String {
             .any(|action| action.kind == HookActionKind::PerformRangeAttack);
     if uses_melee_helper {
         output.push_str(&format!(
-            "function ENT:NBCPerformMeleeAttack()\n    self:Attack({{\n        damage = math.Rand({}, {}),\n        delay = {},\n        type = {},\n        range = self.MeleeAttackRange\n    }})\nend\n\n",
+            "function ENT:NBCPerformMeleeAttack()\n    if #self.NBCMeleeSounds > 0 then self:EmitSound(table.Random(self.NBCMeleeSounds)) end\n    self:Attack({{\n        damage = function(target)\n            if self.NBCIgnoreNextbots and target:IsNextBot() then return 0 end\n            return math.Rand({}, {})\n        end,\n        delay = {},\n        type = {},\n        range = self.MeleeAttackRange\n    }})\nend\n\n",
             format_number(bot.combat.melee_damage_min as f64), format_number(bot.combat.melee_damage_max as f64),
             format_number(bot.combat.melee_delay as f64), bot.combat.melee_damage_type
         ));
     }
     if uses_range_helper {
         output.push_str(&format!(
-            "function ENT:NBCPerformRangeAttack()\n    local projectile = self:CreateProjectile({}, {{\n        Contact = function(entity, target)\n            if not IsValid(target) or target == self then return end\n            target:TakeDamage({}, self, entity)\n            entity:Remove()\n        end\n    }})\n    if IsValid(projectile) then\n        projectile:SetPos(self:EyePos() + self:GetForward()*20)\n        self:AimProjectile(projectile, {})\n    end\nend\n\n",
+            "function ENT:NBCPerformRangeAttack()\n    if #self.NBCRangedSounds > 0 then self:EmitSound(table.Random(self.NBCRangedSounds)) end\n    local projectile = self:CreateProjectile({}, {{\n        Contact = function(entity, target)\n            if not IsValid(target) or target == self then return end\n            if self.NBCIgnoreNextbots and target:IsNextBot() then return end\n            target:TakeDamage({}, self, entity)\n            entity:Remove()\n        end\n    }})\n    if IsValid(projectile) then\n        projectile:SetPos(self:EyePos() + self:GetForward()*20)\n        self:AimProjectile(projectile, {})\n    end\nend\n\n",
             lua_string(&bot.combat.projectile_class), format_number(bot.combat.ranged_damage as f64),
             format_number(bot.combat.ranged_speed as f64)
         ));
     }
     let mut bodies: BTreeMap<HookEvent, Vec<String>> = BTreeMap::new();
+    if bot.ignore_nextbots {
+        bodies.entry(HookEvent::OnTakeDamage).or_default().push(
+            "if IsValid(damage:GetAttacker()) and damage:GetAttacker():IsNextBot() then return true end".into()
+        );
+    }
+    for (slot, event) in [
+        (AudioSlot::Alert, HookEvent::OnNewEnemy),
+        (AudioSlot::LostEnemy, HookEvent::OnLastEnemy),
+    ] {
+        if !slot.get(&bot.audio).is_empty() {
+            bodies.entry(event).or_default().push(format!(
+                "if not self:IsDead() and not self:IsDown() and #self.{0} > 0 then self:EmitSound(table.Random(self.{0})) end", slot.lua_field()
+            ));
+        }
+    }
+    if !bot.audio.chase.is_empty() {
+        // Keep playback separate from user CustomThink recipes, which can choose their own delay.
+        bodies.entry(HookEvent::ServerInitialize).or_default().push(
+            r#"local chaseTimer = "NBCChaseSound_"..self:GetCreationID()
+self:CallOnRemove("NBCChaseSound", function(entity)
+    timer.Remove(chaseTimer)
+    if entity.NBCPlayingChase then entity:StopSound(entity.NBCPlayingChase) end
+end)
+timer.Create(chaseTimer, 0.1, 0, function()
+    if not IsValid(self) then timer.Remove(chaseTimer) return end
+    local pursuing = self:HasEnemy() and not self:IsDead() and not self:IsDown()
+        and not self:IsAIDisabled() and not self:IsPossessed()
+    if not pursuing then
+        if self.NBCPlayingChase then self:StopSound(self.NBCPlayingChase) end
+        self.NBCPlayingChase = nil
+        self.NBCNextChaseSound = 0
+    elseif CurTime() >= (self.NBCNextChaseSound or 0) and #self.NBCChaseClips > 0 then
+        if self.NBCPlayingChase then self:StopSound(self.NBCPlayingChase) end
+        local clip = table.Random(self.NBCChaseClips)
+        self:EmitSound(clip, self.NBCSoundLevel, self.NBCSoundPitch, self.NBCSoundVolume)
+        self.NBCPlayingChase = clip
+        self.NBCNextChaseSound = CurTime() + math.max(SoundDuration(clip)*100/self.NBCSoundPitch, 0.1)
+    end
+end)"#
+                .into(),
+        );
+        for event in [
+            HookEvent::OnLastEnemy,
+            HookEvent::OnDeath,
+            HookEvent::OnDowned,
+        ] {
+            bodies.entry(event).or_default().insert(0,
+                "if self.NBCPlayingChase then self:StopSound(self.NBCPlayingChase) end\nself.NBCPlayingChase = nil\nself.NBCNextChaseSound = 0".into()
+            );
+        }
+    }
     if bot.hooks.patrol_when_idle {
         bodies.entry(HookEvent::OnIdle).or_default().push(format!(
             "self:AddPatrolPos(self:RandomPos({}))",
@@ -1083,7 +1113,7 @@ mod tests {
         let mut bot = project.nextbots[0].clone();
         bot.audio.jump.push(PathBuf::from("jump.mp3"));
         let sounds = SoundNames {
-            jump: Some("nbc.example.npc_my_nextbot.jump".into()),
+            slots: BTreeMap::from([(AudioSlot::Jump, "nbc.example.npc_my_nextbot.jump".into())]),
             ..SoundNames::default()
         };
         let shared = render_shared(
@@ -1115,5 +1145,147 @@ mod tests {
         let shared = render_shared(&project, &bot, &SoundNames::default(), None);
         assert!(shared.contains("ENT.IdleSoundDelay = 0"));
         assert!(!shared.contains("ENT.IdleSoundDelay = 2"));
+    }
+
+    #[test]
+    fn nextbot_protection_precedes_damage_recipes_and_can_be_disabled() {
+        use crate::domain::{HookAction, HookRecipe};
+        let mut bot = Nextbot::new("Hunter", "npc_hunter");
+        bot.combat.ranged_enabled = true;
+        bot.hook_recipes.push(HookRecipe {
+            event: HookEvent::OnTakeDamage,
+            actions: vec![HookAction {
+                kind: HookActionKind::Heal,
+                value: 5.0,
+            }],
+        });
+        let server = render_server(&bot);
+        assert!(server.contains("function ENT:ShouldIgnore(entity)"));
+        assert!(server.contains("target:IsNextBot() then return 0 end"));
+        assert!(server.contains("target:IsNextBot() then return end"));
+        let guard = server
+            .find("damage:GetAttacker():IsNextBot() then return true end")
+            .unwrap();
+        assert!(
+            guard
+                < server
+                    .find("local attacker = damage:GetAttacker()")
+                    .unwrap()
+        );
+        assert_eq!(server.matches("function ENT:OnTakeDamage(").count(), 1);
+        bot.ignore_nextbots = false;
+        let server = render_server(&bot);
+        assert!(!server.contains("function ENT:ShouldIgnore"));
+        assert!(!server.contains("damage:GetAttacker():IsNextBot() then return true end"));
+    }
+
+    #[test]
+    fn sound_hooks_merge_with_recipes_and_chase_cleans_up() {
+        use crate::domain::{HookAction, HookRecipe};
+        let mut project = Project::new("Sounds", PathBuf::from("sounds"));
+        let bot = &mut project.nextbots[0];
+        for slot in AudioSlot::ALL {
+            slot.get_mut(&mut bot.audio).push(PathBuf::from("clip.wav"));
+        }
+        bot.hook_recipes.push(HookRecipe {
+            event: HookEvent::ServerInitialize,
+            actions: vec![HookAction {
+                kind: HookActionKind::PlaySpawnSound,
+                value: 0.0,
+            }],
+        });
+        bot.hook_recipes.push(HookRecipe {
+            event: HookEvent::OnNewEnemy,
+            actions: vec![HookAction {
+                kind: HookActionKind::PlayDamageSound,
+                value: 0.0,
+            }],
+        });
+        let server = render_server(bot);
+        assert_eq!(server.matches("function ENT:CustomInitialize(").count(), 1);
+        assert_eq!(server.matches("function ENT:OnNewEnemy(").count(), 1);
+        assert!(server.contains("table.Random(self.NBCAlertSounds)"));
+        assert!(server.contains("table.Random(self.OnDamageSounds)"));
+        assert!(server.contains("table.Random(self.OnSpawnSounds)"));
+        assert!(server.contains("timer.Create(chaseTimer, 0.1, 0, function()"));
+        assert!(server.contains("timer.Remove(chaseTimer)"));
+        assert!(server.contains("SoundDuration(clip)*100/self.NBCSoundPitch"));
+        for hook in ["OnLastEnemy", "OnDeath", "OnDowned"] {
+            let body = server
+                .split(&format!("function ENT:{hook}("))
+                .nth(1)
+                .unwrap()
+                .split("\nend")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("self:StopSound(self.NBCPlayingChase)"),
+                "{hook}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "functional smoke test: requires NEXTBOTCREATOR_FFMPEG or FFmpeg on PATH"]
+    fn all_sound_slots_convert_register_and_remove_only_manifest_files() {
+        let root = std::env::temp_dir().join(format!("nbc_sound_smoke_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut project = Project::new("Sound smoke", root.clone());
+        let source = root.join("source.wav");
+        let samples = vec![0_u8; 8820];
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + samples.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&44100_u32.to_le_bytes());
+        wav.extend_from_slice(&88200_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&samples);
+        fs::write(&source, wav).unwrap();
+        for slot in AudioSlot::ALL {
+            slot.get_mut(&mut project.nextbots[0].audio)
+                .extend([source.clone(), source.clone()]);
+        }
+        crate::persistence::save_project(&project).unwrap();
+        let mut project = crate::persistence::load_project(&root).unwrap();
+        generate_project(&project, &root).unwrap();
+        let shared =
+            fs::read_to_string(root.join("lua/entities/npc_my_nextbot/shared.lua")).unwrap();
+        let sound_script =
+            fs::read_to_string(root.join("lua/autorun/nbc_sound_smoke_sounds.lua")).unwrap();
+        assert!(shared.contains("function ENT:OnLandOnGround()"));
+        assert!(shared.contains("ENT.NBCChaseClips = {\"nextbotcreator/"));
+        assert!(sound_script.starts_with(&watermark()));
+        for slot in AudioSlot::ALL {
+            assert!(shared.contains(&format!("ENT.{} = ", slot.lua_field())));
+            assert!(
+                sound_script.contains(&format!("nbc.sound_smoke.npc_my_nextbot.{}", slot.key()))
+            );
+            for index in 1..=2 {
+                let wave = root.join(format!(
+                    "sound/nextbotcreator/sound_smoke/npc_my_nextbot/{}_{index:02}.wav",
+                    slot.key()
+                ));
+                let bytes = fs::read(wave).unwrap();
+                assert_eq!(&bytes[..4], b"RIFF");
+                assert!(bytes.windows(4).any(|chunk| chunk == b"data"));
+            }
+        }
+        let untracked = root.join("sound/user-recording.wav");
+        fs::write(&untracked, b"keep me").unwrap();
+        for slot in AudioSlot::ALL {
+            slot.get_mut(&mut project.nextbots[0].audio).clear();
+        }
+        let report = generate_project(&project, &root).unwrap();
+        assert!(report.files_removed >= 27);
+        assert!(source.is_file());
+        assert_eq!(fs::read(untracked).unwrap(), b"keep me");
+        fs::remove_dir_all(root).unwrap();
     }
 }

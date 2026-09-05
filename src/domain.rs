@@ -16,6 +16,17 @@ pub struct Project {
 }
 
 impl Project {
+    pub fn unique_class_name(&self, requested: &str) -> String {
+        let base = sanitize_class_name(requested);
+        let mut candidate = base.clone();
+        let mut suffix = 2;
+        while self.nextbots.iter().any(|bot| bot.class_name == candidate) {
+            candidate = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        candidate
+    }
+
     pub fn new(name: impl Into<String>, root: PathBuf) -> Self {
         let name = name.into();
         let slug = slugify(&name);
@@ -39,6 +50,8 @@ pub struct Nextbot {
     pub custom_tab_name: String,
     pub category: String,
     pub admin_only: bool,
+    #[serde(default = "default_true")]
+    pub ignore_nextbots: bool,
     pub base: BaseVariant,
     pub properties: BTreeMap<String, PropertyValue>,
     pub visual: VisualSettings,
@@ -74,6 +87,7 @@ impl Nextbot {
             custom_tab_name: "Nextbots".into(),
             category: "Nextbot".into(),
             admin_only: false,
+            ignore_nextbots: true,
             base: BaseVariant::Sprite,
             properties,
             visual: VisualSettings::default(),
@@ -312,8 +326,8 @@ impl BehaviorPreset {
                 step_height: 35.0,
                 yaw_rate: 720.0,
                 death_drop_height: 1_000_000.0,
-                walk_speed: 200.0,
-                run_speed: 360.0,
+                walk_speed: 210.0,
+                run_speed: 380.0,
                 climbs: true,
                 climb_speed: 300.0,
                 melee_enabled: true,
@@ -473,6 +487,18 @@ pub struct AudioSettings {
     #[serde(default)]
     pub jump: Vec<PathBuf>,
     pub footsteps: Vec<PathBuf>,
+    #[serde(default)]
+    pub alert: Vec<PathBuf>,
+    #[serde(default)]
+    pub chase: Vec<PathBuf>,
+    #[serde(default)]
+    pub lost_enemy: Vec<PathBuf>,
+    #[serde(default)]
+    pub melee: Vec<PathBuf>,
+    #[serde(default)]
+    pub ranged: Vec<PathBuf>,
+    #[serde(default)]
+    pub land: Vec<PathBuf>,
     pub volume: f32,
     pub pitch: u16,
     pub sound_level: u16,
@@ -489,9 +515,162 @@ impl Default for AudioSettings {
             downed: Vec::new(),
             jump: Vec::new(),
             footsteps: Vec::new(),
+            alert: Vec::new(),
+            chase: Vec::new(),
+            lost_enemy: Vec::new(),
+            melee: Vec::new(),
+            ranged: Vec::new(),
+            land: Vec::new(),
             volume: 1.0,
             pitch: 100,
             sound_level: 75,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AudioSlot {
+    Spawn,
+    Idle,
+    Alert,
+    Chase,
+    LostEnemy,
+    Melee,
+    Ranged,
+    Damage,
+    Death,
+    Downed,
+    Jump,
+    Land,
+    Footsteps,
+}
+
+impl AudioSlot {
+    pub const ALL: [Self; 13] = [
+        Self::Spawn,
+        Self::Idle,
+        Self::Alert,
+        Self::Chase,
+        Self::LostEnemy,
+        Self::Melee,
+        Self::Ranged,
+        Self::Damage,
+        Self::Death,
+        Self::Downed,
+        Self::Jump,
+        Self::Land,
+        Self::Footsteps,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::Idle => "idle",
+            Self::Alert => "alert",
+            Self::Chase => "chase",
+            Self::LostEnemy => "lost_enemy",
+            Self::Melee => "melee",
+            Self::Ranged => "ranged",
+            Self::Damage => "damage",
+            Self::Death => "death",
+            Self::Downed => "downed",
+            Self::Jump => "jump",
+            Self::Land => "land",
+            Self::Footsteps => "footsteps",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Spawn => "Spawn",
+            Self::Idle => "Idle",
+            Self::Alert => "Enemy spotted",
+            Self::Chase => "Chase",
+            Self::LostEnemy => "Enemy lost",
+            Self::Melee => "Melee attack",
+            Self::Ranged => "Ranged attack",
+            Self::Damage => "Damage",
+            Self::Death => "Death",
+            Self::Downed => "Downed",
+            Self::Jump => "Jump",
+            Self::Land => "Landing",
+            Self::Footsteps => "Footsteps",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Spawn => "When the NextBot appears in the world.",
+            Self::Idle => "Ambient audio, with optional continuous playback.",
+            Self::Alert => "When acquiring an enemy after having no target.",
+            Self::Chase => "Repeated while pursuing an enemy; stops when pursuit ends.",
+            Self::LostEnemy => "When the last enemy is lost or defeated.",
+            Self::Melee => "When performing a melee attack.",
+            Self::Ranged => "When firing a projectile attack.",
+            Self::Damage => "When taking damage, with the configured damage delay.",
+            Self::Death => "When killed.",
+            Self::Downed => "When entering a downed state.",
+            Self::Jump => "When leaving the ground.",
+            Self::Land => "When touching down after a jump or fall.",
+            Self::Footsteps => "Footstep animation events on supported models.",
+        }
+    }
+
+    pub fn lua_field(self) -> &'static str {
+        match self {
+            Self::Spawn => "OnSpawnSounds",
+            Self::Idle => "OnIdleSounds",
+            Self::Alert => "NBCAlertSounds",
+            Self::Chase => "NBCChaseSounds",
+            Self::LostEnemy => "NBCLostEnemySounds",
+            Self::Melee => "NBCMeleeSounds",
+            Self::Ranged => "NBCRangedSounds",
+            Self::Damage => "OnDamageSounds",
+            Self::Death => "OnDeathSounds",
+            Self::Downed => "OnDownedSounds",
+            Self::Jump => "JumpSounds",
+            Self::Land => "NBCLandSounds",
+            Self::Footsteps => "Footsteps",
+        }
+    }
+
+    pub fn get(self, audio: &AudioSettings) -> &Vec<PathBuf> {
+        match self {
+            Self::Spawn => &audio.spawn,
+            Self::Idle => &audio.idle,
+            Self::Alert => &audio.alert,
+            Self::Chase => &audio.chase,
+            Self::LostEnemy => &audio.lost_enemy,
+            Self::Melee => &audio.melee,
+            Self::Ranged => &audio.ranged,
+            Self::Damage => &audio.damage,
+            Self::Death => &audio.death,
+            Self::Downed => &audio.downed,
+            Self::Jump => &audio.jump,
+            Self::Land => &audio.land,
+            Self::Footsteps => &audio.footsteps,
+        }
+    }
+
+    pub fn get_mut(self, audio: &mut AudioSettings) -> &mut Vec<PathBuf> {
+        match self {
+            Self::Spawn => &mut audio.spawn,
+            Self::Idle => &mut audio.idle,
+            Self::Alert => &mut audio.alert,
+            Self::Chase => &mut audio.chase,
+            Self::LostEnemy => &mut audio.lost_enemy,
+            Self::Melee => &mut audio.melee,
+            Self::Ranged => &mut audio.ranged,
+            Self::Damage => &mut audio.damage,
+            Self::Death => &mut audio.death,
+            Self::Downed => &mut audio.downed,
+            Self::Jump => &mut audio.jump,
+            Self::Land => &mut audio.land,
+            Self::Footsteps => &mut audio.footsteps,
         }
     }
 }
@@ -1004,7 +1183,7 @@ mod tests {
         assert_eq!(bot.combat.melee_damage_min, 1_000_000.0);
         assert_eq!(
             bot.properties.get("RunSpeed"),
-            Some(&PropertyValue::Number(360.0))
+            Some(&PropertyValue::Number(380.0))
         );
         assert!(!bot.hooks.patrol_when_idle);
 
@@ -1032,6 +1211,10 @@ mod tests {
             .remove("killfeed_icon");
         bot["audio"].as_object_mut().unwrap().remove("jump");
         bot["audio"].as_object_mut().unwrap().remove("idle_loop");
+        bot.remove("ignore_nextbots");
+        for key in ["alert", "chase", "lost_enemy", "melee", "ranged", "land"] {
+            bot["audio"].as_object_mut().unwrap().remove(key);
+        }
 
         let loaded: Project = serde_json::from_value(value).unwrap();
         assert_eq!(
@@ -1040,5 +1223,37 @@ mod tests {
         );
         assert!(loaded.nextbots[0].audio.jump.is_empty());
         assert!(!loaded.nextbots[0].audio.idle_loop);
+        assert!(loaded.nextbots[0].ignore_nextbots);
+        for slot in AudioSlot::ALL {
+            assert!(slot.get(&loaded.nextbots[0].audio).is_empty());
+        }
+    }
+
+    #[test]
+    fn explicit_nextbot_relationship_choice_survives_presets_and_round_trip() {
+        let mut bot = Nextbot::new("Hunter", "npc_hunter");
+        assert!(bot.ignore_nextbots);
+        bot.ignore_nextbots = false;
+        for preset in BehaviorPreset::ALL {
+            bot.apply_behavior_preset(preset);
+            assert!(!bot.ignore_nextbots);
+        }
+        let loaded: Nextbot = serde_json::from_str(&serde_json::to_string(&bot).unwrap()).unwrap();
+        assert!(!loaded.ignore_nextbots);
+    }
+
+    #[test]
+    fn class_names_stay_unique_after_repeated_duplicates_and_removal() {
+        let mut project = Project::new("Pack", PathBuf::from("pack"));
+        for _ in 0..3 {
+            let class = project.unique_class_name("npc_my_nextbot_copy");
+            project.nextbots.push(Nextbot::new("Copy", class));
+        }
+        assert_eq!(project.nextbots[3].class_name, "npc_my_nextbot_copy_3");
+        project.nextbots.remove(2);
+        assert_eq!(
+            project.unique_class_name("npc_my_nextbot_copy"),
+            "npc_my_nextbot_copy_2"
+        );
     }
 }

@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
 use nextbot_creator::catalog::{PropertySection, PropertySpec, property_catalog};
 use nextbot_creator::converter;
 use nextbot_creator::domain::{
-    ATTACK_ACTIVITIES, BaseVariant, BehaviorPreset, BindTrigger, DAMAGE_TYPES, HookAction,
-    HookActionKind, HookEvent, HookRecipe, KillfeedIconMode, Nextbot, POSSESSION_KEYS,
+    ATTACK_ACTIVITIES, AudioSlot, BaseVariant, BehaviorPreset, BindTrigger, DAMAGE_TYPES,
+    HookAction, HookActionKind, HookEvent, HookRecipe, KillfeedIconMode, Nextbot, POSSESSION_KEYS,
     PossessionAction, PossessionBind, PossessionView, Project, PropertyValue, SpawnTab,
     sanitize_class_name, slugify,
 };
@@ -16,7 +18,7 @@ use nextbot_creator::integration::{self, LinkStatus};
 use nextbot_creator::persistence::{self, AppSettings};
 use nextbot_creator::{APP_NAME, APP_VERSION, PROJECT_FILE};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum EditorPage {
     Basic,
     Visual,
@@ -42,16 +44,22 @@ impl EditorPage {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Basic => "Basic",
-            Self::Visual => "Visual",
-            Self::Audio => "Audio",
+            Self::Basic => "Overview",
+            Self::Visual => "Appearance",
+            Self::Audio => "Sounds",
             Self::Combat => "Combat",
             Self::Possession => "Possession",
             Self::Events => "Events",
             Self::Advanced => "Advanced",
-            Self::Project => "Project",
+            Self::Project => "Project settings",
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum LeaveAction {
+    Home,
+    Close,
 }
 
 pub struct CreatorApp {
@@ -68,6 +76,17 @@ pub struct CreatorApp {
     detected_gmod: Vec<PathBuf>,
     preview: Option<(PathBuf, egui::TextureHandle)>,
     killfeed_preview: Option<(PathBuf, egui::TextureHandle)>,
+    saved_project: Option<Project>,
+    generation: Option<JoinHandle<Result<generator::GenerationReport, String>>>,
+    generation_started: Option<Instant>,
+    leave_action: Option<LeaveAction>,
+    allow_close: bool,
+    removed_bot: Option<(usize, Nextbot)>,
+    bot_search: String,
+    audio_search: String,
+    ffmpeg_available: bool,
+    link_cache: Option<(Instant, LinkStatus)>,
+    status_details: bool,
 }
 
 impl CreatorApp {
@@ -85,6 +104,7 @@ impl CreatorApp {
             settings.garrys_mod_root = detected_gmod.first().cloned();
         }
         let recent_projects = settings.available_projects();
+        let ffmpeg_available = converter::ffmpeg_path(&portable_root).is_some();
         Self {
             portable_root,
             settings,
@@ -99,6 +119,17 @@ impl CreatorApp {
             detected_gmod,
             preview: None,
             killfeed_preview: None,
+            saved_project: None,
+            generation: None,
+            generation_started: None,
+            leave_action: None,
+            allow_close: false,
+            removed_bot: None,
+            bot_search: String::new(),
+            audio_search: String::new(),
+            ffmpeg_available,
+            link_cache: None,
+            status_details: false,
         }
     }
 
@@ -112,40 +143,135 @@ impl CreatorApp {
         self.status_is_error = true;
     }
 
-    fn save(&mut self) {
-        let Some(project) = &self.project else { return };
+    fn save(&mut self) -> bool {
+        let Some(project) = &self.project else {
+            return true;
+        };
         match persistence::save_project(project) {
-            Ok(()) => self.set_status("Project saved."),
-            Err(error) => self.set_error(error),
+            Ok(()) => {
+                self.saved_project = Some(project.clone());
+                self.set_status("Project saved.");
+                true
+            }
+            Err(error) => {
+                self.set_error(error);
+                false
+            }
         }
     }
 
+    fn is_dirty(&self) -> bool {
+        self.project != self.saved_project
+    }
+
     fn generate(&mut self) {
-        let Some(project) = &self.project else { return };
-        if let Err(error) = persistence::save_project(project) {
-            self.set_error(error);
+        if self.generation.is_some() || self.project.is_none() || !self.save() {
             return;
         }
-        match generator::generate_project(project, &self.portable_root) {
-            Ok(report) => {
-                let mut message = format!("Generated {} files", report.files_written);
-                if report.files_removed > 0 {
-                    message.push_str(&format!("; removed {} stale files", report.files_removed));
+        let project = self.project.as_ref().unwrap().clone();
+        let root = self.portable_root.clone();
+        self.generation_started = Some(Instant::now());
+        self.generation = Some(std::thread::spawn(move || {
+            generator::generate_project(&project, &root).map_err(|error| error.to_string())
+        }));
+        self.set_status("Generating addon and converting assets...");
+    }
+
+    fn poll_generation(&mut self, context: &egui::Context) {
+        if self
+            .generation
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            let result = self.generation.take().unwrap().join();
+            self.generation_started = None;
+            self.link_cache = None;
+            match result {
+                Ok(Ok(report)) => {
+                    let mut message = format!("Generated {} files", report.files_written);
+                    if report.files_removed > 0 {
+                        message
+                            .push_str(&format!("; removed {} stale files", report.files_removed));
+                    }
+                    if !report.warnings.is_empty() {
+                        message.push_str(&format!(
+                            ". {} warning(s): {}",
+                            report.warnings.len(),
+                            report.warnings.join(" | ")
+                        ));
+                    }
+                    self.set_status(message);
                 }
-                if !report.warnings.is_empty() {
-                    message.push_str(&format!(
-                        ". {} warning(s): {}",
-                        report.warnings.len(),
-                        report.warnings.join(" | ")
-                    ));
-                }
-                self.set_status(message);
+                Ok(Err(error)) => self.set_error(error),
+                Err(_) => self.set_error(
+                    "Generation stopped unexpectedly. Your project is saved; try generating again.",
+                ),
             }
-            Err(error) => self.set_error(error),
+        }
+        if self.generation.is_some() {
+            context.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn request_leave(&mut self, action: LeaveAction, context: &egui::Context) {
+        if self.generation.is_some() {
+            self.set_status("Finish generating before closing the project.");
+        } else if self.is_dirty() {
+            self.leave_action = Some(action);
+        } else {
+            self.leave_project(action, context);
+        }
+    }
+
+    fn leave_project(&mut self, action: LeaveAction, context: &egui::Context) {
+        self.leave_action = None;
+        match action {
+            LeaveAction::Close => {
+                self.allow_close = true;
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            LeaveAction::Home => {
+                self.project = None;
+                self.saved_project = None;
+                self.preview = None;
+                self.killfeed_preview = None;
+                self.removed_bot = None;
+                self.link_cache = None;
+            }
+        }
+    }
+
+    fn leave_dialog(&mut self, context: &egui::Context) {
+        let Some(action) = self.leave_action else {
+            return;
+        };
+        let response = egui::Modal::new(egui::Id::new("unsaved_changes")).show(context, |ui| {
+            ui.set_width(400.0);
+            ui.heading("Save your changes?");
+            ui.label("This project has unsaved edits.");
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.add(primary_button("Save and continue")).clicked() && self.save() {
+                    self.leave_project(action, context);
+                }
+                if ui.button("Discard edits").clicked() {
+                    self.leave_project(action, context);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.leave_action = None;
+                }
+            });
+            if self.status_is_error {
+                ui.colored_label(error_color(), &self.status);
+            }
+        });
+        if response.should_close() {
+            self.leave_action = None;
         }
     }
 
     fn link_or_unlink(&mut self, unlink: bool) {
+        self.link_cache = None;
         let (Some(project), Some(gmod)) = (&self.project, &self.settings.garrys_mod_root) else {
             self.set_error("Choose a valid Garry's Mod folder first.");
             return;
@@ -182,11 +308,21 @@ impl CreatorApp {
             self.new_project_name.trim(),
         ) {
             Ok(project) => {
+                if project.nextbots.is_empty() {
+                    self.set_error("This project contains no NextBots.");
+                    return;
+                }
                 let project_root = project.root.clone();
                 self.selected_bot = 0;
                 self.preview = None;
                 self.killfeed_preview = None;
+                self.saved_project = Some(project.clone());
                 self.project = Some(project);
+                self.page = EditorPage::Basic;
+                self.bot_search.clear();
+                self.audio_search.clear();
+                self.removed_bot = None;
+                self.link_cache = None;
                 self.settings.remember_project(&project_root);
                 self.refresh_recent();
                 match self.settings.save(&self.portable_root) {
@@ -203,8 +339,18 @@ impl CreatorApp {
     fn open_project(&mut self, path: &Path) {
         match persistence::load_project(path) {
             Ok(project) => {
+                if project.nextbots.is_empty() {
+                    self.set_error("This project contains no NextBots.");
+                    return;
+                }
                 let project_root = project.root.clone();
+                self.saved_project = Some(project.clone());
                 self.project = Some(project);
+                self.page = EditorPage::Basic;
+                self.bot_search.clear();
+                self.audio_search.clear();
+                self.removed_bot = None;
+                self.link_cache = None;
                 self.selected_bot = 0;
                 self.preview = None;
                 self.killfeed_preview = None;
@@ -349,312 +495,484 @@ impl CreatorApp {
             .frame(panel_frame())
             .show_inside(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(APP_NAME).size(20.0).strong().color(accent()));
-                    ui.label(RichText::new(format!("v{APP_VERSION}")).weak());
-                    ui.separator();
-                    if ui.button("Home").clicked() {
-                        self.project = None;
-                        self.preview = None;
-                        self.killfeed_preview = None;
-                    }
-                    let launch = ui
-                        .add_enabled(
-                            self.settings.garrys_mod_root.is_some(),
-                            egui::Button::new("Launch GMod"),
-                        )
-                        .on_hover_text(if self.settings.garrys_mod_root.is_some() {
-                            "Start Garry's Mod from the configured installation"
-                        } else {
-                            "Choose or detect a Garry's Mod installation first"
-                        });
-                    if launch.clicked() {
-                        self.launch_gmod();
-                    }
-                    if self.project.is_some() {
-                        if ui.button("Save").clicked() {
-                            self.save();
+                    ui.label(RichText::new(APP_NAME).size(19.0).strong());
+                    ui.label(RichText::new(format!("v{APP_VERSION}")).small().weak());
+                    let busy = self.generation.is_some();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.project.is_some() {
+                            if ui
+                                .add_enabled(!busy, primary_button("Generate addon"))
+                                .on_hover_text("Save and generate all NextBots (Ctrl+G)")
+                                .clicked()
+                            {
+                                self.generate();
+                            }
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("Save"))
+                                .on_hover_text("Save project (Ctrl+S)")
+                                .clicked()
+                            {
+                                self.save();
+                            }
                         }
                         if ui
-                            .add(
-                                egui::Button::new(RichText::new("Generate addon").strong())
-                                    .fill(accent().gamma_multiply(0.45)),
+                            .add_enabled(
+                                self.settings.garrys_mod_root.is_some(),
+                                egui::Button::new("Launch GMod"),
                             )
+                            .on_hover_text("Launch the configured Garry's Mod installation")
                             .clicked()
                         {
-                            self.generate();
+                            self.launch_gmod();
                         }
-                        let link_status = self.current_link_status();
-                        match link_status {
-                            LinkStatus::Linked(_) => {
-                                if ui.button("Unlink from GMod").clicked() {
-                                    self.link_or_unlink(true);
-                                }
-                            }
-                            LinkStatus::Unlinked => {
-                                if ui.button("Link to GMod").clicked() {
-                                    self.link_or_unlink(false);
-                                }
-                            }
-                            LinkStatus::Conflict(_) => {
-                                ui.colored_label(Color32::YELLOW, "Addon-path conflict");
-                            }
+                        if self.project.is_some() {
+                            ui.add_enabled_ui(!busy, |ui| {
+                                ui.menu_button("Project", |ui| {
+                                    if ui.button("Open project folder").clicked() {
+                                        if let Some(project) = &self.project {
+                                            open_in_explorer(&project.root);
+                                        }
+                                        ui.close();
+                                    }
+                                    match self.current_link_status() {
+                                        LinkStatus::Linked(_) => {
+                                            if ui.button("Unlink from Garry's Mod").clicked() {
+                                                self.link_or_unlink(true);
+                                                ui.close();
+                                            }
+                                        }
+                                        LinkStatus::Unlinked => {
+                                            if ui
+                                                .add_enabled(
+                                                    self.settings.garrys_mod_root.is_some(),
+                                                    egui::Button::new("Link to Garry's Mod"),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.link_or_unlink(false);
+                                                ui.close();
+                                            }
+                                        }
+                                        LinkStatus::Conflict(path) => {
+                                            ui.colored_label(
+                                                error_color(),
+                                                "Addon path is already occupied",
+                                            )
+                                            .on_hover_text(path.display().to_string());
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button("Project settings").clicked() {
+                                        self.page = EditorPage::Project;
+                                        ui.close();
+                                    }
+                                    if ui.button("Back to projects").clicked() {
+                                        self.request_leave(LeaveAction::Home, ui.ctx());
+                                        ui.close();
+                                    }
+                                });
+                            });
+                            ui.label(
+                                RichText::new(if self.is_dirty() {
+                                    "Unsaved changes"
+                                } else {
+                                    "Saved"
+                                })
+                                .small()
+                                .color(if self.is_dirty() {
+                                    accent()
+                                } else {
+                                    Color32::from_gray(145)
+                                }),
+                            );
                         }
-                        if ui.button("Open folder").clicked()
-                            && let Some(project) = &self.project
-                        {
-                            open_in_explorer(&project.root);
-                        }
-                    }
+                    });
                 });
             });
     }
 
-    fn current_link_status(&self) -> LinkStatus {
-        match (&self.project, &self.settings.garrys_mod_root) {
+    fn current_link_status(&mut self) -> LinkStatus {
+        if let Some((checked, status)) = &self.link_cache
+            && checked.elapsed() < Duration::from_secs(3)
+        {
+            return status.clone();
+        }
+        let status = match (&self.project, &self.settings.garrys_mod_root) {
             (Some(project), Some(gmod)) => {
                 integration::link_status(gmod, &project.slug, &project.root)
             }
             _ => LinkStatus::Unlinked,
+        };
+        self.link_cache = Some((Instant::now(), status.clone()));
+        status
+    }
+
+    fn status_bar(&mut self, root: &mut egui::Ui) {
+        egui::Panel::bottom("status_bar").frame(panel_frame()).show_inside(root, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(started) = self.generation_started {
+                    ui.spinner();
+                    ui.label(format!("Generating · {:.0}s", started.elapsed().as_secs_f32()));
+                } else {
+                    ui.colored_label(if self.status_is_error { error_color() } else { Color32::from_rgb(130, 197, 166) },
+                        if self.status_is_error { "Needs attention" } else { "Ready" });
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Details").clicked() { self.status_details = !self.status_details; }
+                    if self.removed_bot.is_some() && ui.add_enabled(self.generation.is_none(), egui::Button::new("Undo remove").small()).clicked()
+                        && let Some((index, mut bot)) = self.removed_bot.take() && let Some(project) = &mut self.project {
+                        bot.class_name = project.unique_class_name(&bot.class_name);
+                        let index = index.min(project.nextbots.len());
+                        project.nextbots.insert(index, bot);
+                        self.select_bot(index);
+                    }
+                    if !self.ffmpeg_available {
+                        ui.label(RichText::new("Audio tool unavailable").small().color(Color32::from_rgb(224, 182, 107)))
+                            .on_hover_text("FFmpeg is needed when generating audio. Place it in the portable tools folder.");
+                    }
+                    ui.add(egui::Label::new(&self.status).truncate()).on_hover_text(&self.status);
+                });
+            });
+        });
+        if self.status_details {
+            egui::Window::new("Activity details")
+                .open(&mut self.status_details)
+                .default_width(560.0)
+                .show(root.ctx(), |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            ui.label(&self.status);
+                        });
+                    if ui.button("Copy details").clicked() {
+                        ui.ctx().copy_text(self.status.clone());
+                    }
+                    if ui.button("Refresh audio tool").clicked() {
+                        self.ffmpeg_available =
+                            converter::ffmpeg_path(&self.portable_root).is_some();
+                    }
+                });
         }
     }
 
     fn home(&mut self, root: &mut egui::Ui) {
-        egui::CentralPanel::default().show_inside(root, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                ui.heading(RichText::new("Build a DRGBase NextBot").size(30.0));
-                ui.label(
-                    RichText::new(
-                        "Portable projects, automatic asset conversion, no Lua required.",
-                    )
-                    .weak(),
-                );
-                ui.add_space(30.0);
-            });
-            ui.columns(2, |columns| {
-                columns[0].group(|ui| {
-                    ui.heading("New project");
-                    ui.label("Project name");
-                    ui.text_edit_singleline(&mut self.new_project_name);
-                    ui.label(RichText::new("Saved under").small().weak());
-                    path_label(ui, &self.settings.projects_root);
-                    if ui
-                        .add_enabled(
-                            !self.new_project_name.trim().is_empty(),
-                            egui::Button::new("Create project"),
-                        )
-                        .clicked()
-                    {
-                        self.create_project();
-                    }
-                });
-                columns[1].group(|ui| {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(20, 21, 27))
+                    .inner_margin(28),
+            )
+            .show_inside(root, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        ui.heading("Recent projects");
-                        if ui.small_button("Refresh").clicked() {
-                            self.refresh_recent();
-                        }
-                        if ui.small_button("Open another…").clicked()
-                            && let Some(path) = rfd::FileDialog::new().pick_folder()
-                        {
-                            self.open_project(&path);
-                        }
+                        ui.label(RichText::new("Projects").size(28.0).strong());
+                        ui.label(
+                            RichText::new(format!("{} available", self.recent_projects.len()))
+                                .small()
+                                .weak(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Open project...").clicked()
+                                && let Some(path) = rfd::FileDialog::new().pick_folder()
+                            {
+                                self.open_project(&path);
+                            }
+                        });
                     });
-                    let projects = self.recent_projects.clone();
-                    if projects.is_empty() {
-                        ui.label(RichText::new("No projects yet.").weak());
-                    }
-                    for path in projects {
-                        let name = path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("Project");
-                        if ui
-                            .selectable_label(false, name)
-                            .on_hover_text(path.display().to_string())
-                            .clicked()
-                        {
-                            self.open_project(&path);
-                        }
-                    }
-                });
-            });
-            ui.add_space(24.0);
-            ui.group(|ui| {
-                ui.heading("Garry's Mod");
-                if let Some(path) = &self.settings.garrys_mod_root {
-                    path_label(ui, path);
-                } else {
-                    ui.label("Not detected");
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Choose folder…").clicked()
-                        && let Some(path) = rfd::FileDialog::new().pick_folder()
-                    {
-                        match integration::normalize_gmod_root(&path) {
-                            Some(path) => {
-                                self.settings.garrys_mod_root = Some(path);
-                                if let Err(error) = self.settings.save(&self.portable_root) {
-                                    self.set_error(error);
-                                } else {
-                                    self.set_status("Garry's Mod path saved.");
+                    ui.add_space(20.0);
+                    ui.columns(2, |columns| {
+                        card_frame().show(&mut columns[0], |ui| {
+                            ui.heading(RichText::new("New project").strong());
+                            ui.label("Project name");
+                            let name = ui.add(
+                                egui::TextEdit::singleline(&mut self.new_project_name)
+                                    .hint_text("Project name")
+                                    .desired_width(ui.available_width()),
+                            );
+                            let create_on_enter = name.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                            ui.label(RichText::new("Saved under").small().weak());
+                            path_label(ui, &self.settings.projects_root);
+                            if ui
+                                .add_enabled(
+                                    !self.new_project_name.trim().is_empty(),
+                                    primary_button("Create project"),
+                                )
+                                .clicked()
+                                || (create_on_enter && !self.new_project_name.trim().is_empty())
+                            {
+                                self.create_project();
+                            }
+                        });
+                        card_frame().show(&mut columns[1], |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.heading(RichText::new("Recent projects").strong());
+                                if ui.small_button("Refresh").clicked() {
+                                    self.refresh_recent();
+                                }
+                            });
+                            let projects = self.recent_projects.clone();
+                            if projects.is_empty() {
+                                ui.label(RichText::new("No projects yet.").weak());
+                            }
+                            for path in projects {
+                                let name = path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("Project");
+                                if ui
+                                    .selectable_label(false, name)
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    self.open_project(&path);
                                 }
                             }
-                            None => {
-                                self.set_error("That folder does not contain garrysmod/addons.")
-                            }
-                        }
-                    }
-                    if ui.button("Detect again").clicked() {
-                        self.detected_gmod = integration::detect_garrys_mod();
-                        if let Some(path) = self.detected_gmod.first().cloned() {
-                            self.settings.garrys_mod_root = Some(path);
-                            let _ = self.settings.save(&self.portable_root);
-                            self.set_status("Garry's Mod detected.");
+                        });
+                    });
+                    ui.add_space(24.0);
+                    card_frame().show(ui, |ui| {
+                        ui.heading("Garry's Mod");
+                        if let Some(path) = &self.settings.garrys_mod_root {
+                            path_label(ui, path);
                         } else {
-                            self.set_error(
-                                "No Garry's Mod installation was found in Steam libraries.",
-                            );
+                            ui.label("Not detected");
                         }
-                    }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Choose folder…").clicked()
+                                && let Some(path) = rfd::FileDialog::new().pick_folder()
+                            {
+                                match integration::normalize_gmod_root(&path) {
+                                    Some(path) => {
+                                        self.settings.garrys_mod_root = Some(path);
+                                        self.link_cache = None;
+                                        if let Err(error) = self.settings.save(&self.portable_root)
+                                        {
+                                            self.set_error(error);
+                                        } else {
+                                            self.set_status("Garry's Mod path saved.");
+                                        }
+                                    }
+                                    None => self.set_error(
+                                        "That folder does not contain garrysmod/addons.",
+                                    ),
+                                }
+                            }
+                            if ui.button("Detect again").clicked() {
+                                self.detected_gmod = integration::detect_garrys_mod();
+                                if let Some(path) = self.detected_gmod.first().cloned() {
+                                    self.settings.garrys_mod_root = Some(path);
+                                    self.link_cache = None;
+                                    let _ = self.settings.save(&self.portable_root);
+                                    self.set_status("Garry's Mod detected.");
+                                } else {
+                                    self.set_error(
+                                        "No Garry's Mod installation was found in Steam libraries.",
+                                    );
+                                }
+                            }
+                        });
+                    });
                 });
             });
-        });
     }
 
     fn project_ui(&mut self, root: &mut egui::Ui) {
         self.bot_sidebar(root);
-        egui::Panel::bottom("status_bar")
-            .frame(panel_frame())
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(20, 21, 27))
+                    .inner_margin(24),
+            )
             .show_inside(root, |ui| {
-                let color = if self.status_is_error {
-                    Color32::from_rgb(255, 110, 125)
-                } else {
-                    Color32::from_rgb(150, 180, 165)
-                };
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(if self.status_is_error {
-                            "Error"
-                        } else {
-                            "Status"
-                        })
-                        .strong()
-                        .color(color),
-                    );
-                    ui.label(&self.status);
-                    if converter::ffmpeg_path(&self.portable_root).is_none() {
-                        ui.separator();
-                        ui.colored_label(
-                            Color32::YELLOW,
-                            "FFmpeg is unavailable; audio generation is disabled.",
+                let project = self.project.as_ref().unwrap();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&project.name).small().weak());
+                    if self.page != EditorPage::Project {
+                        ui.label(RichText::new("/").weak());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&project.nextbots[self.selected_bot].display_name)
+                                    .small(),
+                            )
+                            .truncate(),
                         );
                     }
                 });
+                ui.label(RichText::new(self.page.label()).size(28.0).strong());
+                ui.label(RichText::new(page_description(self.page)).weak());
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
+                let project_key = project.root.clone();
+                egui::ScrollArea::vertical()
+                    .id_salt(("editor", project_key, self.selected_bot, self.page))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width().min(920.0));
+                        ui.add_enabled_ui(self.generation.is_none(), |ui| {
+                            ui.push_id((self.selected_bot, self.page), |ui| match self.page {
+                                EditorPage::Basic => self.basic_editor(ui),
+                                EditorPage::Visual => {
+                                    let context = ui.ctx().clone();
+                                    self.visual_editor(ui, &context);
+                                }
+                                EditorPage::Audio => self.audio_editor(ui),
+                                EditorPage::Combat => self.combat_editor(ui),
+                                EditorPage::Possession => self.possession_editor(ui),
+                                EditorPage::Events => self.events_editor(ui),
+                                EditorPage::Advanced => self.advanced_editor(ui),
+                                EditorPage::Project => self.project_editor(ui),
+                            });
+                        });
+                        ui.add_space(24.0);
+                    });
             });
+    }
 
-        egui::CentralPanel::default().show_inside(root, |ui| {
-            ui.horizontal(|ui| {
-                for page in EditorPage::ALL {
-                    if ui
-                        .selectable_label(self.page == page, page.label())
-                        .clicked()
-                    {
-                        self.page = page;
-                    }
-                }
-            });
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| match self.page {
-                    EditorPage::Basic => self.basic_editor(ui),
-                    EditorPage::Visual => {
-                        let context = ui.ctx().clone();
-                        self.visual_editor(ui, &context)
-                    }
-                    EditorPage::Audio => self.audio_editor(ui),
-                    EditorPage::Combat => self.combat_editor(ui),
-                    EditorPage::Possession => self.possession_editor(ui),
-                    EditorPage::Events => self.events_editor(ui),
-                    EditorPage::Advanced => self.advanced_editor(ui),
-                    EditorPage::Project => self.project_editor(ui),
-                });
-        });
+    fn select_bot(&mut self, index: usize) {
+        self.selected_bot = index;
+        self.preview = None;
+        self.killfeed_preview = None;
+        if self.page == EditorPage::Project {
+            self.page = EditorPage::Basic;
+        }
     }
 
     fn bot_sidebar(&mut self, root: &mut egui::Ui) {
         egui::Panel::left("bot_sidebar")
             .resizable(false)
-            .default_size(210.0)
+            .default_size(226.0)
             .frame(panel_frame())
             .show_inside(root, |ui| {
-                ui.heading("NextBots");
-                let names = self
-                    .project
-                    .as_ref()
-                    .map(|project| {
-                        project
-                            .nextbots
-                            .iter()
-                            .map(|bot| bot.display_name.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                for (index, name) in names.iter().enumerate() {
-                    if ui
-                        .selectable_label(self.selected_bot == index, name)
-                        .clicked()
-                    {
-                        self.selected_bot = index;
-                        self.preview = None;
-                        self.killfeed_preview = None;
-                    }
-                }
-                ui.add_space(8.0);
-                if ui.button("+ Add NextBot").clicked()
-                    && let Some(project) = self.project.as_mut()
-                {
-                    let index = project.nextbots.len() + 1;
-                    project.nextbots.push(Nextbot::new(
-                        format!("Nextbot {index}"),
-                        format!("npc_{}_{}", project.slug, index),
-                    ));
-                    self.selected_bot = project.nextbots.len() - 1;
-                    self.preview = None;
-                    self.killfeed_preview = None;
-                }
-                if ui.button("Duplicate").clicked()
-                    && let Some(project) = self.project.as_mut()
-                    && let Some(mut duplicate) = project.nextbots.get(self.selected_bot).cloned()
-                {
-                    duplicate.display_name.push_str(" Copy");
-                    duplicate.class_name = format!("{}_copy", duplicate.class_name);
-                    project.nextbots.push(duplicate);
-                    self.selected_bot = project.nextbots.len() - 1;
-                    self.preview = None;
-                    self.killfeed_preview = None;
-                }
-                let can_remove = self
-                    .project
-                    .as_ref()
-                    .is_some_and(|project| project.nextbots.len() > 1);
-                if ui
-                    .add_enabled(can_remove, egui::Button::new("Remove"))
-                    .clicked()
-                    && let Some(project) = self.project.as_mut()
-                {
-                    project.nextbots.remove(self.selected_bot);
-                    self.selected_bot = self
-                        .selected_bot
-                        .min(project.nextbots.len().saturating_sub(1));
-                    self.preview = None;
-                    self.killfeed_preview = None;
-                }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.label(RichText::new("DRGBase required in-game").small().weak());
+                let busy = self.generation.is_some();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("NEXTBOTS").small().strong().weak());
+                    ui.label(
+                        RichText::new(self.project.as_ref().unwrap().nextbots.len().to_string())
+                            .small()
+                            .color(accent()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(!busy, egui::Button::new("+ Add")).clicked()
+                            && let Some(project) = &mut self.project
+                        {
+                            let index = project.nextbots.len() + 1;
+                            let class = project
+                                .unique_class_name(&format!("npc_{}_{}", project.slug, index));
+                            project
+                                .nextbots
+                                .push(Nextbot::new(format!("NextBot {index}"), class));
+                            self.bot_search.clear();
+                            self.select_bot(index - 1);
+                        }
+                    });
                 });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.bot_search)
+                        .hint_text("Find a NextBot...")
+                        .desired_width(f32::INFINITY),
+                );
+                let query = self.bot_search.trim().to_lowercase();
+                let names: Vec<_> = self
+                    .project
+                    .as_ref()
+                    .unwrap()
+                    .nextbots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bot)| {
+                        query.is_empty()
+                            || bot.display_name.to_lowercase().contains(&query)
+                            || bot.class_name.contains(&query)
+                    })
+                    .map(|(i, bot)| (i, bot.display_name.clone(), bot.class_name.clone()))
+                    .collect();
+                egui::ScrollArea::vertical()
+                    .id_salt("bot_list")
+                    .max_height((ui.available_height() * 0.18).clamp(70.0, 150.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if names.is_empty() {
+                            ui.label(RichText::new("No matching NextBots").small().weak());
+                        }
+                        for (index, name, class) in names {
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 34.0],
+                                    egui::Button::selectable(
+                                        self.selected_bot == index,
+                                        RichText::new(name),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(class)
+                                .clicked()
+                            {
+                                self.select_bot(index);
+                            }
+                        }
+                    });
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("Duplicate")
+                            .on_hover_text("Copy the selected NextBot with a unique class name")
+                            .clicked()
+                            && let Some(project) = &mut self.project
+                        {
+                            let mut bot = project.nextbots[self.selected_bot].clone();
+                            bot.display_name.push_str(" Copy");
+                            bot.class_name =
+                                project.unique_class_name(&format!("{}_copy", bot.class_name));
+                            project.nextbots.push(bot);
+                            let index = project.nextbots.len() - 1;
+                            self.bot_search.clear();
+                            self.select_bot(index);
+                        }
+                        if ui
+                            .add_enabled(
+                                self.project.as_ref().unwrap().nextbots.len() > 1,
+                                egui::Button::new("Remove").small(),
+                            )
+                            .clicked()
+                            && let Some(project) = &mut self.project
+                        {
+                            let index = self.selected_bot;
+                            self.removed_bot = Some((index, project.nextbots.remove(index)));
+                            let selected = index.min(project.nextbots.len() - 1);
+                            self.select_bot(selected);
+                            self.set_status("NextBot removed. Use Undo remove to restore it.");
+                        }
+                    });
+                });
+                ui.add_space(12.0);
+                ui.separator();
+                ui.label(RichText::new("EDIT NEXTBOT").small().strong().weak());
+                egui::ScrollArea::vertical()
+                    .id_salt("navigation")
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.spacing_mut().button_padding.y = 4.0;
+                        ui.spacing_mut().interact_size.y = 26.0;
+                        for page in EditorPage::ALL {
+                            if page == EditorPage::Project {
+                                ui.add_space(4.0);
+                            }
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 28.0],
+                                    egui::Button::selectable(self.page == page, page.label()),
+                                )
+                                .clicked()
+                            {
+                                self.page = page;
+                            }
+                        }
+                    });
             });
     }
 
@@ -740,7 +1058,7 @@ impl CreatorApp {
         );
 
         ui.add_space(16.0);
-        ui.heading("Quick behavior presets");
+        ui.heading("Behavior");
         ui.horizontal_wrapped(|ui| {
             for preset in BehaviorPreset::ALL {
                 if ui
@@ -760,8 +1078,17 @@ impl CreatorApp {
             .weak(),
         );
 
+        ui.add_space(10.0);
+        field_row(
+            ui,
+            "Other NextBots",
+            "Keep multiple hunters focused on their enemies without fighting each other.",
+            |ui| {
+                ui.checkbox(&mut bot.ignore_nextbots, "Ignore other NextBots");
+            },
+        );
         ui.add_space(16.0);
-        ui.heading("Common DRGBase settings");
+        ui.heading("Common settings");
         let specs = property_catalog()
             .into_iter()
             .filter(|spec| spec.basic)
@@ -795,12 +1122,14 @@ impl CreatorApp {
             });
         }
         ui.heading("Model & texture");
-        ui.label("PNG, JPEG, BMP, TGA, WebP and GIF inputs are scaled with aspect-preserving transparent padding and encoded as DXT5 VTF. GIFs become animated VTFs. Existing VTF/VMT pairs are accepted.");
+        ui.label(RichText::new("Import an image, GIF, or VTF/VMT pair. GIFs animate in-game; image proportions are preserved.").weak());
         if ui.button("Import visual asset…").clicked() {
             self.import_visual(context);
         }
         if let Some((_, texture)) = &self.preview {
-            ui.add(egui::Image::new(texture).max_size(egui::vec2(280.0, 280.0)));
+            card_frame().show(ui, |ui| {
+                ui.add(egui::Image::new(texture).max_size(egui::vec2(240.0, 240.0)));
+            });
         }
         let Some(bot) = self.selected_bot_mut() else {
             return;
@@ -931,47 +1260,19 @@ impl CreatorApp {
     }
 
     fn audio_editor(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Sounds");
-        ui.label("All imported audio is normalized to mono 16-bit PCM WAV at 44.1 kHz for reliable Source playback. Multiple files in a slot are selected randomly through a generated sound script.");
-        let slots = [
-            AudioSlot::Spawn,
-            AudioSlot::Idle,
-            AudioSlot::Damage,
-            AudioSlot::Death,
-            AudioSlot::Downed,
-            AudioSlot::Jump,
-            AudioSlot::Footsteps,
-        ];
-        for slot in slots {
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.strong(slot.label());
-                    if ui.small_button("Add files…").clicked() {
-                        self.import_audio(slot);
-                    }
-                });
-                let Some(bot) = self.selected_bot_mut() else {
-                    return;
-                };
-                let files = slot.get_mut(&mut bot.audio);
-                let mut remove = None;
-                for (index, file) in files.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            file.file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("audio"),
-                        );
-                        if ui.small_button("Remove").clicked() {
-                            remove = Some(index);
-                        }
-                    });
-                }
-                if let Some(index) = remove {
-                    files.remove(index);
-                }
-            });
-        }
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.audio_search)
+                    .hint_text("Find a sound type...")
+                    .desired_width(280.0),
+            );
+            if ui.small_button("Clear").clicked() {
+                self.audio_search.clear();
+            }
+        });
+        ui.label(RichText::new("Add several clips to a sound type for random variations. Imported audio is converted automatically.").small().weak());
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Playback settings").show(ui, |ui| {
         let Some(bot) = self.selected_bot_mut() else {
             return;
         };
@@ -1012,6 +1313,76 @@ impl CreatorApp {
                 ui.add(egui::Slider::new(&mut bot.audio.sound_level, 20..=180).suffix(" dB"));
             },
         );
+
+        });
+        ui.add_space(6.0);
+        let query = self.audio_search.trim().to_lowercase();
+        let mut shown = 0;
+        for slot in AudioSlot::ALL {
+            if !query.is_empty()
+                && !slot.label().to_lowercase().contains(&query)
+                && !slot.description().to_lowercase().contains(&query)
+            {
+                continue;
+            }
+            shown += 1;
+            ui.push_id(slot, |ui| {
+                card_frame().inner_margin(12).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.strong(slot.label());
+                        let count = self
+                            .project
+                            .as_ref()
+                            .map(|project| {
+                                slot.get(&project.nextbots[self.selected_bot].audio).len()
+                            })
+                            .unwrap_or(0);
+                        ui.label(RichText::new(format!("{count} clips")).small().weak());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("+ Add files").clicked() {
+                                self.import_audio(slot);
+                            }
+                        });
+                    });
+                    ui.label(RichText::new(slot.description()).small().weak());
+                    let Some(bot) = self.selected_bot_mut() else {
+                        return;
+                    };
+                    let files = slot.get_mut(&mut bot.audio);
+                    let mut remove = None;
+                    for (index, file) in files.iter().enumerate() {
+                        ui.push_id(index, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("Remove").clicked() {
+                                            remove = Some(index);
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                file.file_name()
+                                                    .and_then(|name| name.to_str())
+                                                    .unwrap_or("audio"),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(file.display().to_string());
+                                    },
+                                );
+                            });
+                        });
+                    }
+                    if let Some(index) = remove {
+                        files.remove(index);
+                    }
+                });
+            });
+        }
+        if shown == 0 {
+            ui.label("No sound types match your search.");
+        }
     }
 
     fn combat_editor(&mut self, ui: &mut egui::Ui) {
@@ -1201,11 +1572,14 @@ impl CreatorApp {
     }
 
     fn advanced_editor(&mut self, ui: &mut egui::Ui) {
-        ui.heading("All documented DRGBase properties");
-        ui.label("Cataloged from the current DRGBase base, human, sprite, and official template sources. Values are emitted as typed Lua; no free-form code is required.");
         ui.horizontal(|ui| {
             ui.label("Search");
-            ui.text_edit_singleline(&mut self.advanced_search);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.advanced_search)
+                    .id(egui::Id::new("advanced_search"))
+                    .hint_text("Search settings, descriptions, or sections...")
+                    .desired_width(340.0),
+            );
             if ui.small_button("Clear").clicked() {
                 self.advanced_search.clear();
             }
@@ -1215,6 +1589,7 @@ impl CreatorApp {
             return;
         };
         let catalog = property_catalog();
+        let mut matches = 0;
         for section in PropertySection::ALL {
             let specs = catalog
                 .iter()
@@ -1223,13 +1598,18 @@ impl CreatorApp {
                     query.is_empty()
                         || spec.name.to_ascii_lowercase().contains(&query)
                         || spec.label.to_ascii_lowercase().contains(&query)
+                        || spec.help.to_ascii_lowercase().contains(&query)
+                        || spec.section.label().to_ascii_lowercase().contains(&query)
                 })
                 .cloned()
                 .collect::<Vec<_>>();
             if specs.is_empty() {
                 continue;
             }
-            egui::CollapsingHeader::new(section.label())
+            matches += specs.len();
+            egui::CollapsingHeader::new(format!("{}  ·  {}", section.label(), specs.len()))
+                .id_salt(section.label())
+                .open((!query.is_empty()).then_some(true))
                 .default_open(matches!(
                     section,
                     PropertySection::Stats | PropertySection::Ai
@@ -1237,6 +1617,9 @@ impl CreatorApp {
                 .show(ui, |ui| {
                     render_property_specs(ui, bot, &specs);
                 });
+        }
+        if matches == 0 {
+            ui.label("No settings match. Try a broader term, such as speed or sound.");
         }
     }
 
@@ -1341,6 +1724,7 @@ impl CreatorApp {
             match integration::normalize_gmod_root(&path) {
                 Some(path) => {
                     self.settings.garrys_mod_root = Some(path);
+                    self.link_cache = None;
                     if let Err(error) = self.settings.save(&self.portable_root) {
                         self.set_error(error);
                     } else {
@@ -1355,59 +1739,37 @@ impl CreatorApp {
 
 impl eframe::App for CreatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let context = ui.ctx().clone();
+        self.poll_generation(&context);
+        if context.input(|input| input.viewport().close_requested())
+            && !self.allow_close
+            && (self.is_dirty() || self.generation.is_some())
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_leave(LeaveAction::Close, &context);
+        }
+        if self.leave_action.is_none() && self.generation.is_none() {
+            if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
+                self.save();
+            }
+            if context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::G)) {
+                self.generate();
+            }
+            if self.project.is_some()
+                && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F))
+            {
+                self.page = EditorPage::Advanced;
+                context.memory_mut(|memory| memory.request_focus(egui::Id::new("advanced_search")));
+            }
+        }
         self.top_bar(ui);
+        self.status_bar(ui);
         if self.project.is_none() {
-            egui::Panel::bottom("home_status")
-                .frame(panel_frame())
-                .show_inside(ui, |ui| {
-                    let color = if self.status_is_error {
-                        Color32::from_rgb(255, 110, 125)
-                    } else {
-                        Color32::GRAY
-                    };
-                    ui.colored_label(color, &self.status);
-                });
             self.home(ui);
         } else {
             self.project_ui(ui);
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum AudioSlot {
-    Spawn,
-    Idle,
-    Damage,
-    Death,
-    Downed,
-    Jump,
-    Footsteps,
-}
-
-impl AudioSlot {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Spawn => "Spawn",
-            Self::Idle => "Idle",
-            Self::Damage => "Damage",
-            Self::Death => "Death",
-            Self::Downed => "Downed",
-            Self::Jump => "Jump",
-            Self::Footsteps => "Footsteps",
-        }
-    }
-
-    fn get_mut(self, audio: &mut nextbot_creator::domain::AudioSettings) -> &mut Vec<PathBuf> {
-        match self {
-            Self::Spawn => &mut audio.spawn,
-            Self::Idle => &mut audio.idle,
-            Self::Damage => &mut audio.damage,
-            Self::Death => &mut audio.death,
-            Self::Downed => &mut audio.downed,
-            Self::Jump => &mut audio.jump,
-            Self::Footsteps => &mut audio.footsteps,
-        }
+        self.leave_dialog(&context);
     }
 }
 
@@ -1499,13 +1861,40 @@ fn field_row<R>(
     help: &str,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    ui.horizontal_top(|ui| {
-        ui.vertical(|ui| {
-            ui.set_width(180.0);
-            ui.strong(label).on_hover_text(help);
-            ui.label(RichText::new(help).small().weak());
-        });
-        ui.vertical(|ui| add_contents(ui)).inner
+    ui.push_id(label, |ui| {
+        ui.spacing_mut().item_spacing.y = 5.0;
+        let width = ui.available_width();
+        let result = if width < 520.0 {
+            ui.vertical(|ui| {
+                ui.strong(label).on_hover_text(help);
+                ui.horizontal_wrapped(add_contents).inner
+            })
+            .inner
+        } else {
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(190.0, 26.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_min_width(190.0);
+                        ui.add_space(5.0);
+                        ui.strong(label).on_hover_text(help);
+                    },
+                );
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    let result = ui.horizontal_wrapped(add_contents).inner;
+                    if !help.is_empty() {
+                        ui.label(RichText::new(help).small().weak());
+                    }
+                    result
+                })
+                .inner
+            })
+            .inner
+        };
+        ui.add_space(3.0);
+        result
     })
     .inner
 }
@@ -1570,7 +1959,7 @@ fn load_preview_named(
     texture_name: &'static str,
 ) -> Option<egui::TextureHandle> {
     let image = load_visual_image(path)?;
-    let rgba = image.to_rgba8();
+    let rgba = image.thumbnail(512, 512).to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Some(context.load_texture(
         texture_name,
@@ -1598,29 +1987,99 @@ fn load_visual_image(path: &Path) -> Option<image::DynamicImage> {
 }
 
 fn configure_theme(context: &egui::Context) {
+    context.set_theme(egui::Theme::Dark);
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(18, 19, 23);
-    visuals.window_fill = Color32::from_rgb(22, 23, 28);
-    visuals.extreme_bg_color = Color32::from_rgb(10, 11, 14);
-    visuals.selection.bg_fill = accent().gamma_multiply(0.55);
+    visuals.panel_fill = Color32::from_rgb(20, 21, 27);
+    visuals.window_fill = Color32::from_rgb(27, 29, 37);
+    visuals.extreme_bg_color = Color32::from_rgb(16, 17, 22);
+    visuals.faint_bg_color = Color32::from_rgb(30, 32, 41);
+    visuals.weak_text_color = Some(Color32::from_rgb(151, 153, 167));
+    visuals.selection.bg_fill = Color32::from_rgb(74, 44, 78);
+    visuals.selection.stroke = egui::Stroke::new(1.0, Color32::from_rgb(247, 197, 239));
     visuals.hyperlink_color = accent();
-    visuals.widgets.active.bg_fill = accent().gamma_multiply(0.65);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(62, 38, 65);
+    visuals.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.0, Color32::from_rgb(43, 46, 57));
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(35, 37, 47);
+    visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(35, 37, 47);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(52, 55, 67));
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(57, 47, 64);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(57, 47, 64);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent().gamma_multiply(0.65));
+    visuals.widgets.active.bg_fill = Color32::from_rgb(77, 46, 78);
+    for widgets in [
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+    ] {
+        widgets.corner_radius = egui::CornerRadius::same(6);
+    }
     context.set_visuals(visuals);
     context.global_style_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.animation_time = 0.10;
+        style.spacing.item_spacing = egui::vec2(10.0, 9.0);
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.spacing.interact_size.y = 30.0;
+        style.spacing.text_edit_width = 270.0;
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(19.0));
     });
 }
 
+fn page_description(page: EditorPage) -> &'static str {
+    match page {
+        EditorPage::Basic => "Give your NextBot an identity and choose how it behaves.",
+        EditorPage::Visual => "Shape its appearance, animation, and killfeed icon.",
+        EditorPage::Audio => "Give each moment its own sound.",
+        EditorPage::Combat => "Tune melee attacks, projectiles, and combat behavior.",
+        EditorPage::Possession => "Configure player control, camera views, and actions.",
+        EditorPage::Events => "Build custom reactions with code-free action recipes.",
+        EditorPage::Advanced => {
+            "Find and fine-tune every documented DRGBase setting. Ctrl+F to search."
+        }
+        EditorPage::Project => "Manage project details and your Garry's Mod connection.",
+    }
+}
+
 fn accent() -> Color32 {
-    Color32::from_rgb(235, 30, 210)
+    Color32::from_rgb(219, 128, 207)
+}
+
+fn error_color() -> Color32 {
+    Color32::from_rgb(246, 131, 145)
+}
+
+fn primary_button(label: &str) -> egui::Button<'_> {
+    egui::Button::new(
+        RichText::new(label)
+            .strong()
+            .color(Color32::from_rgb(23, 17, 26)),
+    )
+    .fill(accent())
+    .stroke(egui::Stroke::NONE)
+}
+
+fn card_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Color32::from_rgb(27, 29, 37))
+        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(43, 46, 57)))
+        .corner_radius(10)
+        .inner_margin(16)
 }
 
 fn panel_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(Color32::from_rgb(14, 15, 18))
-        .inner_margin(egui::Margin::symmetric(8, 7))
+        .fill(Color32::from_rgb(16, 17, 22))
+        .inner_margin(egui::Margin::symmetric(14, 10))
 }
 
 fn open_in_explorer(path: &Path) {
@@ -1631,5 +2090,104 @@ fn open_in_explorer(path: &Path) {
     #[cfg(not(windows))]
     {
         let _ = path;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_for_test(name: &str) -> CreatorApp {
+        let root = std::env::temp_dir().join(format!("nbc_ui_{name}_{}", std::process::id()));
+        let project = Project::new("UI test", root.clone());
+        CreatorApp {
+            portable_root: root.clone(),
+            settings: AppSettings {
+                projects_root: root,
+                garrys_mod_root: None,
+                recent_projects: Vec::new(),
+            },
+            saved_project: Some(project.clone()),
+            project: Some(project),
+            recent_projects: Vec::new(),
+            selected_bot: 0,
+            page: EditorPage::Basic,
+            new_project_name: String::new(),
+            status: String::new(),
+            status_is_error: false,
+            advanced_search: String::new(),
+            detected_gmod: Vec::new(),
+            preview: None,
+            killfeed_preview: None,
+            generation: None,
+            generation_started: None,
+            leave_action: None,
+            allow_close: false,
+            removed_bot: None,
+            bot_search: String::new(),
+            audio_search: String::new(),
+            ffmpeg_available: false,
+            link_cache: None,
+            status_details: false,
+        }
+    }
+
+    #[test]
+    fn leaving_an_edited_project_requires_a_save_or_explicit_discard() {
+        let mut app = app_for_test("leave");
+        let context = egui::Context::default();
+        app.project.as_mut().unwrap().name = "Unsaved".into();
+        app.request_leave(LeaveAction::Home, &context);
+        assert!(app.project.is_some());
+        assert!(app.leave_action.is_some());
+        app.leave_action = None; // Cancel keeps the edits.
+        assert!(app.is_dirty());
+        app.leave_project(LeaveAction::Home, &context); // Explicit discard.
+        assert!(app.project.is_none());
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn failed_save_preserves_edits_and_the_last_saved_state() {
+        let mut app = app_for_test("failed_save");
+        let root = app.portable_root.clone();
+        std::fs::write(&root, b"A file blocks this project directory").unwrap();
+        app.project.as_mut().unwrap().name = "Keep this edit".into();
+        assert!(!app.save());
+        assert!(app.status_is_error);
+        assert!(app.is_dirty());
+        assert_eq!(app.project.as_ref().unwrap().name, "Keep this edit");
+        assert_eq!(app.saved_project.as_ref().unwrap().name, "UI test");
+        std::fs::remove_file(root).unwrap();
+    }
+
+    #[test]
+    fn background_generation_saves_and_prevents_duplicate_jobs_or_closing() {
+        let mut app = app_for_test("generation");
+        let root = app.portable_root.clone();
+        let context = egui::Context::default();
+        app.project.as_mut().unwrap().name = "Updated".into();
+        app.generate();
+        assert!(app.generation.is_some());
+        assert!(!app.is_dirty());
+        let started = app.generation_started;
+        app.generate();
+        assert_eq!(app.generation_started, started);
+        app.request_leave(LeaveAction::Close, &context);
+        assert!(app.project.is_some());
+        assert!(!app.allow_close);
+        let timeout = Instant::now();
+        while app.generation.is_some() && timeout.elapsed() < Duration::from_secs(10) {
+            app.poll_generation(&context);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.generation.is_none());
+        assert!(!app.status_is_error, "{}", app.status);
+        assert!(
+            root.join("lua/entities/npc_my_nextbot/shared.lua")
+                .is_file()
+        );
+        assert_eq!(persistence::load_project(&root).unwrap().name, "Updated");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
